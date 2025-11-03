@@ -20,7 +20,7 @@ from nltk.tokenize import sent_tokenize
 
 MAX_TEXT_LENGTH = 5000  # Max chars per document to process
 MIN_SENTENCE_LENGTH = 15  # Min chars for valid sentence
-MAX_DOCS_TO_PROCESS = 10000  # Total documents to extract
+MAX_DOCS_TO_PROCESS = 20000  # Total documents to extract
 STAGE1_CHECKPOINT_INTERVAL = 50  # Docs per checkpoint
 STAGE2_CHECKPOINT_INTERVAL = 20
 STAGE3_CHECKPOINT_INTERVAL = 20
@@ -29,6 +29,16 @@ STAGE3_BATCH_DELAY = 30  # seconds
 DIFFUSION_T_MAX = 40  # Max timestep for diffusion noise
 DIFFUSION_SIGMA_MIN = 0.02
 DIFFUSION_SIGMA_MAX = 0.5
+
+# === PARALLEL PROCESSING CONFIG ===
+import os
+import concurrent.futures
+
+NUM_WORKERS = min(4, os.cpu_count() or 4)  # Auto-detect CPUs
+STAGE2_PARALLEL = True  # Enable parallel embeddings
+STAGE3_PARALLEL = True  # Enable parallel API calls
+STAGE3_MAX_WORKERS = 2  # Ollama concurrent requests (stay under rate limit)
+STAGE3_REQUESTS_PER_SEC = 2  # Ollama rate limit (adjust based on your setup)
 
 # Valid compartments and hierarchies (FIX #8: Validation)
 VALID_COMPARTMENTS = {'FACTUAL', 'PROCEDURAL', 'EPISODIC', 'CONTEXTUAL', 'CONCEPTUAL'}
@@ -93,6 +103,99 @@ logger.info(f"Base path: {BASE_PATH}")
 logger.info(f"Cache path: {CACHE_PATH}")
 logger.info(f"Output path: {OUTPUT_PATH}")
 logger.info(f"Checkpoint dir: {CHECKPOINT_DIR}")
+
+import concurrent.futures
+from functools import partial
+
+# Add after your imports
+NUM_WORKERS = 4  # Adjust based on your CPU cores (use os.cpu_count() for auto)
+
+def parallel_encode_batch(texts, encoder, max_workers=NUM_WORKERS):
+    """
+    Parallel batch encoding for embeddings.
+    Uses ThreadPoolExecutor for I/O-bound embedding generation.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        embeddings = list(executor.map(encoder.encode, texts))
+    return embeddings
+
+def parallel_process_segments(segments, encoder, max_workers=NUM_WORKERS):
+    """
+    Process segments in parallel with error handling.
+    Returns list of (segment, embedding) tuples.
+    """
+    results = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_seg = {
+            executor.submit(encoder.encode, seg['text']): seg 
+            for seg in segments
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_seg):
+            seg = future_to_seg[future]
+            try:
+                embedding = future.result()
+                if hasattr(embedding, 'tolist'):
+                    embedding = embedding.tolist()
+                elif isinstance(embedding, np.ndarray):
+                    embedding = embedding.tolist()
+                results.append((seg, embedding))
+            except Exception as e:
+                logger.warning(f"Embedding failed for segment: {e}")
+                results.append((seg, None))
+    
+    return results
+
+import threading
+from collections import deque
+
+class RateLimitedExecutor:
+    """
+    Thread-safe rate-limited parallel executor for Ollama API.
+    Prevents 429 errors while maximizing throughput.
+    """
+    def __init__(self, max_workers=2, requests_per_second=2):
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        self.requests_per_second = requests_per_second
+        self.min_interval = 1.0 / requests_per_second
+        self.last_request_time = 0
+        self.lock = threading.Lock()
+    
+    def _rate_limited_submit(self, fn, *args, **kwargs):
+        """Submit with rate limiting."""
+        with self.lock:
+            now = time.time()
+            time_since_last = now - self.last_request_time
+            
+            if time_since_last < self.min_interval:
+                sleep_time = self.min_interval - time_since_last
+                time.sleep(sleep_time)
+            
+            self.last_request_time = time.time()
+        
+        return fn(*args, **kwargs)
+    
+    def map(self, fn, items):
+        """Rate-limited parallel map."""
+        futures = []
+        for item in items:
+            future = self.executor.submit(self._rate_limited_submit, fn, item)
+            futures.append(future)
+        
+        results = []
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as e:
+                logger.error(f"Task failed: {e}")
+                results.append(None)
+        
+        return results
+    
+    def shutdown(self):
+        self.executor.shutdown(wait=True)
+
 
 def save_checkpoint(data, checkpoint_name):
     """Save checkpoint (FIX #15: No redundant file size logging)."""
@@ -603,11 +706,26 @@ logger.info("✓ Science filter applied")
 #             logger.info(f"Saved lightweight checkpoint")
             
 #             # FIX #1: Proper incremental append (only NEW samples)
+#             # FIX #1: Proper incremental append (only NEW samples)
 #             stage1_file = os.path.join(OUTPUT_PATH, "stage1_pretrain.jsonl")
-#             with open(stage1_file, 'a', encoding='utf-8') as f:
+#             with open(stage1_file, 'a', encoding='utf-8', newline='') as f:  # FIX: Add newline=''
 #                 for item in stage1_data[last_written_stage1_idx:]:
-#                     f.write(json.dumps(item, ensure_ascii=False))
-            
+#                     try:
+#                         # FIX: Handle NaN/Inf in embeddings before serialization
+#                         if 'clean_embedding' in item and item['clean_embedding'] is not None:
+#                             item['clean_embedding'] = [float(x) if not (np.isnan(x) or np.isinf(x)) else 0.0 
+#                                                     for x in item['clean_embedding']]
+#                         if 'noisy_embedding' in item and item['noisy_embedding'] is not None:
+#                             item['noisy_embedding'] = [float(x) if not (np.isnan(x) or np.isinf(x)) else 0.0 
+#                                                     for x in item['noisy_embedding']]
+                        
+#                         json_str = json.dumps(item, ensure_ascii=False)
+#                         f.write(json_str)
+#                         # f.write('\n')  # FIX: Separate line (NOT concatenated with json_str)
+#                     except (TypeError, ValueError) as e:
+#                         logger.error(f"Skipping item due to serialization error: {e}")
+#                         continue
+
 #             # FIX #1: Update tracker
 #             written_count = len(stage1_data) - last_written_stage1_idx
 #             logger.info(f"Appended {written_count} new samples to Stage 1 JSONL")
@@ -672,30 +790,76 @@ logger.info("="*80)
 logger.info("LOADING doc_data FROM STAGE 1 CHECKPOINT")
 logger.info("="*80)
 
-doc_data = None
+try:
+    doc_data = None
 
-# Try loading from Stage 1 checkpoint
-checkpoint_data = load_checkpoint("stage1_processing")
-if checkpoint_data and 'doc_data' in checkpoint_data:
-    doc_data = checkpoint_data['doc_data']
-    logger.info(f"✓ Loaded doc_data from stage1_processing: {len(doc_data)} documents")
+    # Try loading from Stage 1 checkpoint
+    checkpoint_data = load_checkpoint("stage1_processing")
+    if checkpoint_data and 'doc_data' in checkpoint_data:
+        doc_data = checkpoint_data['doc_data']
+        logger.info(f"✓ Loaded doc_data from stage1_processing: {len(doc_data)} documents")
 
-# Fallback: Try doc_data_for_stage2 checkpoint
-if not doc_data:
-    doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
-    if doc_data_checkpoint and 'doc_data' in doc_data_checkpoint:
-        doc_data = doc_data_checkpoint['doc_data']
-        logger.info(f"✓ Loaded doc_data from doc_data_for_stage2: {len(doc_data)} documents")
+    # Fallback: Try doc_data_for_stage2 checkpoint
+    if not doc_data:
+        doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
+        if doc_data_checkpoint and 'doc_data' in doc_data_checkpoint:
+            doc_data = doc_data_checkpoint['doc_data']
+            logger.info(f"✓ Loaded doc_data from doc_data_for_stage2: {len(doc_data)} documents")
 
-# Validation
-if not doc_data or len(doc_data) == 0:
-    logger.error("✗ No doc_data found! Stage 1 must be completed first.")
-    logger.error("Expected checkpoint: stage1_processing.pkl or doc_data_for_stage2.pkl")
-    raise ValueError("Cannot proceed with Stage 2: No doc_data available")
+    # Validation
+    if not doc_data or len(doc_data) == 0:
+        logger.error("✗ No doc_data found! Stage 1 must be completed first.")
+        logger.error("Expected checkpoint: stage1_processing.pkl or doc_data_for_stage2.pkl")
+        raise ValueError("Cannot proceed with Stage 2: No doc_data available")
+    
+except:
+    # ══════════════════════════════════════════════════════════════
+    # EMERGENCY RECOVERY: Reconstruct checkpoint from logs
+    # ══════════════════════════════════════════════════════════════
+    doc_data = None
+    
+    MANUAL_STAGE1_RECOVERY = True  # Set to False after first successful run
 
-logger.info(f"✓ doc_data ready for Stage 2: {len(doc_data)} documents")
-logger.info("="*80)
+    if MANUAL_STAGE1_RECOVERY:
+        logger.info("="*80)
+        logger.info("MANUAL STAGE 1 RECOVERY MODE")
+        logger.info("="*80)
+        
+        # From your logs: Last checkpoint at doc 11000
+        RECOVERED_DOC_COUNT = 11000
+        RECOVERED_STAGE1_SAMPLES = 2456  # From log: "Total Stage 1 samples: 2456"
+        
+        # Create minimal checkpoint for Stage 2
+        recovery_checkpoint = {
+            'doc_data': {},  # Empty - Stage 2 will use JSONL directly
+            'doccount': RECOVERED_DOC_COUNT,
+            'sciencecount': RECOVERED_DOC_COUNT,  # Assume all science after filter
+            'lastidx': RECOVERED_DOC_COUNT - 1,
+            'docidsprocessed': list(range(RECOVERED_DOC_COUNT)),  # All IDs 0-10999
+            'stage1_samples_written': RECOVERED_STAGE1_SAMPLES,
+            'recovery_mode': True
+        }
+        
+        # Save as stage1_processing checkpoint
+        save_checkpoint(recovery_checkpoint, 'stage1_processing')
+        
+        checkpoint_data = load_checkpoint("stage1_processing")
+        doc_data = checkpoint_data['doc_data']
+        
+        if not doc_data or len(doc_data) == 0:
+            logger.error("No doc_data!")
+            # logger.error("Expected checkpoint: stage1_processing.pkl or doc_data_for_stage2.pkl")
+            # raise ValueError("Cannot proceed with Stage 2: No doc_data available")
+        
+        logger.info(f"✓ Recovery checkpoint created:")
+        logger.info(f"  - Documents: {RECOVERED_DOC_COUNT}")
+        logger.info(f"  - Stage 1 samples: {RECOVERED_STAGE1_SAMPLES} and doc_data length = {len(doc_data)}")
+        logger.info(f"  - Ready for Stage 2")
+        logger.info("="*80)
 
+# ══════════════════════════════════════════════════════════════
+# STAGE 2: SUPERVISED FINE-TUNING (CoT CONSTRUCTION)
+# ══════════════════════════════════════════════════════════════
 
 logger.info("="*80)
 logger.info("STAGE 2: SUPERVISED FINE-TUNING (CoT CONSTRUCTION)")
@@ -704,168 +868,241 @@ logger.info("="*80)
 
 stage2_file = os.path.join(OUTPUT_PATH, "stage2_sft.jsonl")
 
-# ✅ FIX: Always try to resume from checkpoint, even if file exists
-stage2_checkpoint = load_checkpoint("stage2_progress")
-
+# Load checkpoint
+stage2_checkpoint = load_checkpoint('stage2_progress')
 if stage2_checkpoint:
-    # Resume from checkpoint (file may exist from previous run)
-    stage2_data = stage2_checkpoint.get('stage2_data', [])
     processed_doc_ids = set(stage2_checkpoint.get('processed_doc_ids', []))
-    processed_count = len(processed_doc_ids)
-    
-    # Count existing samples in file
-    if os.path.exists(stage2_file):
-        with open(stage2_file, 'r', encoding='utf-8') as f:
-            existing_stage2_count = sum(1 for _ in f)
-        logger.info(f"✓ Stage 2 JSONL exists: {existing_stage2_count} samples")
-    else:
-        existing_stage2_count = 0
-    
-    logger.info(f"✓ Resuming Stage 2:")
-    logger.info(f"  - In-memory samples: {len(stage2_data)}")
-    logger.info(f"  - Already processed docs: {len(processed_doc_ids)}/{len(doc_data)}")
-    logger.info(f"  - Remaining docs: {len(doc_data) - len(processed_doc_ids)}")
-    
-    # Check if already complete
-    if len(processed_doc_ids) >= len(doc_data):
-        logger.info(f"✓ Stage 2 already complete ({len(processed_doc_ids)} docs processed)")
-        logger.info(f"  Total samples in JSONL: {existing_stage2_count}")
-        logger.info("Proceeding to Stage 3...")
-        stage2_data = []  # Clear memory (data already in file)
-    else:
-        logger.info(f"Resuming processing for {len(doc_data) - len(processed_doc_ids)} remaining docs...")
-
+    logger.info(f"✓ Resuming Stage 2")
+    logger.info(f"  - Already processed: {len(processed_doc_ids)} docs")
 else:
-    # No checkpoint - check if file exists (edge case: file exists but no checkpoint)
-    if os.path.exists(stage2_file):
-        with open(stage2_file, 'r', encoding='utf-8') as f:
-            existing_stage2_count = sum(1 for _ in f)
-        logger.warning(f"⚠ Stage 2 JSONL exists ({existing_stage2_count} samples) but no checkpoint found!")
-        logger.warning("This may indicate previous run crashed. Starting fresh...")
-        logger.warning("To resume, ensure stage2_progress.pkl checkpoint exists.")
-        
-        # User choice: Delete file or keep it
-        # Option 1: Keep file, append new results
-        logger.info("Keeping existing file and appending new results...")
-        stage2_data = []
-        processed_doc_ids = set()
-        processed_count = 0
-        
-        # Option 2 (commented out): Delete and restart
-        # os.remove(stage2_file)
-        # logger.info("Deleted existing file to start fresh")
-    else:
-        # Fresh start
-        stage2_data = []
-        processed_doc_ids = set()
-        processed_count = 0
-        logger.info("Starting fresh Stage 2...")
+    processed_doc_ids = set()
+    logger.info("Starting fresh Stage 2...")
 
-# ✅ Only proceed with processing if not already complete
-if len(processed_doc_ids) < len(doc_data):
-    # FIX #11: Validate doc_data exists
-    if not doc_data:
-        doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
-        if doc_data_checkpoint and 'doc_data' in doc_data_checkpoint:
-            doc_data = doc_data_checkpoint['doc_data']
-            logger.info(f"✓ Loaded doc_data: {len(doc_data)} documents")
-        else:
-            logger.error("✗ No doc_data. Run Stage 1 first.")
-            raise ValueError("Cannot proceed without doc_data")
+# ══════════════════════════════════════════════════════════════
+# DATA LOADING: Try 3 sources (checkpoint > JSONL > error)
+# ══════════════════════════════════════════════════════════════
+
+doc_data = None
+use_jsonl_mode = False
+
+# SOURCE 1: Try loading doc_data from Stage 1 checkpoint (original method)
+logger.info("Attempting to load doc_data from checkpoint...")
+checkpoint_data = load_checkpoint('stage1_processing')
+if checkpoint_data and 'doc_data' in checkpoint_data:
+    doc_data = checkpoint_data['doc_data']
+    if len(doc_data) > 0:
+        logger.info(f"✓ Loaded doc_data from checkpoint: {len(doc_data)} documents")
+    else:
+        logger.warning("Checkpoint has empty doc_data, trying JSONL...")
+        doc_data = None
+
+# SOURCE 2: Fallback to JSONL if checkpoint is empty/missing
+if not doc_data:
+    stage1_file = os.path.join(OUTPUT_PATH, "stage1_pretrain.jsonl")
     
-    # FIX #11: Validate not empty
-    if len(doc_data) == 0:
-        logger.error("✗ Stage 2 requires doc_data from Stage 1")
-        logger.error("Please run Stage 1 first or check science filter settings")
-        raise ValueError("Cannot proceed with Stage 2: No documents available")
-    
-    logger.info(f"Processing {len(doc_data)} documents...")
-    logger.info(f"Already processed: {len(processed_doc_ids)}")
-    
-    last_written_idx = 0
-    embedding_failures_total = 0  # FIX #4: Track failures
-    
-    for i, (doc_idx, data) in enumerate(tqdm(doc_data.items(), desc="Stage 2 Processing")):
-        if doc_idx in processed_doc_ids:
-            logger.debug(f"Doc {doc_idx}: Already processed")
-            processed_count += 1
-            continue
+    if os.path.exists(stage1_file):
+        logger.info("Loading Stage 1 data from JSONL (streaming mode)...")
+        use_jsonl_mode = True
         
-    
-    # FIX #11: Validate doc_data exists
-    if not doc_data:
-        doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
-        if doc_data_checkpoint and 'doc_data' in doc_data_checkpoint:
-            doc_data = doc_data_checkpoint['doc_data']
-            logger.info(f"✓ Loaded doc_data: {len(doc_data)} documents")
-        else:
-            logger.error("✗ No doc_data. Run Stage 1 first.")
-            raise ValueError("Cannot proceed without doc_data")
-    
-    # FIX #11: Validate not empty
-    if len(doc_data) == 0:
-        logger.error("✗ Stage 2 requires doc_data from Stage 1")
-        logger.error("Please run Stage 1 first or check science filter settings")
-        raise ValueError("Cannot proceed with Stage 2: No documents available")
-    
-    logger.info(f"Processing {len(doc_data)} documents...")
-    logger.info(f"Already processed: {len(processed_doc_ids)}")
-    
-    last_written_idx = 0
-    embedding_failures_total = 0  # FIX #4: Track failures
-    
-    for i, (doc_idx, data) in enumerate(tqdm(doc_data.items(), desc="Stage 2 Processing")):
-        if doc_idx in processed_doc_ids:
-            logger.debug(f"Doc {doc_idx}: Already processed")
-            processed_count += 1
-            continue
+        from collections import defaultdict
+        query_to_samples = defaultdict(list)
+        doc_metadata = {}
         
-        steps = []
-        embedding_failures_doc = 0
+        line_count = 0
+        with open(stage1_file, 'r', encoding='utf-8') as f:
+            for line in tqdm(f, desc="Loading Stage 1 JSONL"):
+                try:
+                    sample = json.loads(line)
+                    
+                    # Extract doc ID from "pretrain_XXXXXX_YY"
+                    doc_id = int(sample['id'].split('_')[1])
+                    
+                    # Skip if already processed
+                    if doc_id in processed_doc_ids:
+                        continue
+                    
+                    query_to_samples[doc_id].append(sample)
+                    
+                    # Store metadata
+                    if doc_id not in doc_metadata:
+                        doc_metadata[doc_id] = {
+                            'domain': sample['metadata'].get('domain', 'science'),
+                            'query': sample['query'],
+                            'source': sample['metadata'].get('source', 'OpenThoughts3')
+                        }
+                    
+                    line_count += 1
+                    
+                    if line_count % 10000 == 0:
+                        logger.info(f"  Loaded {line_count} samples, {len(query_to_samples)} docs")
+                        
+                except (json.JSONDecodeError, KeyError, ValueError, IndexError):
+                    continue
         
-        for seg in data['segments']:
-            step_num = seg['position'] + 1
-            
-            # Generate embedding for THIS STEP
-            try:
-                step_embedding = sonar_encoder.encode(seg['text'])
-                if hasattr(step_embedding, 'tolist'):
-                    step_embedding = step_embedding.tolist()
-                elif isinstance(step_embedding, np.ndarray):
-                    step_embedding = step_embedding.tolist()
-            except Exception as e:
-                # FIX #4 & #10: Skip step entirely (don't add to chain)
-                logger.warning(f"Doc {doc_idx}, Step {step_num}: Embedding failed - {e}")
-                embedding_failures_doc += 1
-                embedding_failures_total += 1
+        logger.info(f"✓ Loaded {line_count} samples from {len(query_to_samples)} documents")
+        logger.info(f"  Already processed: {len(processed_doc_ids)}")
+        logger.info(f"  Remaining: {len(query_to_samples)}")
+    else:
+        logger.error("✗ No Stage 1 data found (no checkpoint or JSONL)")
+        logger.error("Run Stage 1 first to generate stage1_pretrain.jsonl")
+        raise ValueError("Cannot proceed with Stage 2: No data source")
+
+# SOURCE 3: Error if both methods fail
+if not doc_data and not use_jsonl_mode:
+    logger.error("✗ No data available for Stage 2")
+    raise ValueError("Cannot proceed with Stage 2: No doc_data or JSONL")
+
+# ══════════════════════════════════════════════════════════════
+# PROCESSING: Use appropriate method based on data source
+# ══════════════════════════════════════════════════════════════
+
+if use_jsonl_mode:
+    # ═══ JSONL MODE: Process from pre-grouped samples ═══
+    
+    if len(query_to_samples) == 0:
+        logger.info("Stage 2 already complete!")
+    else:
+        logger.info(f"Processing {len(query_to_samples)} documents...")
+        
+        stage2_data = []
+        last_written_idx = 0
+        processed_count = 0
+        
+        for doc_idx, samples in tqdm(query_to_samples.items(), desc="Stage 2 Processing"):
+            if doc_idx in processed_doc_ids:
                 continue
             
-            importance = compute_importance_score(seg['text'])
-            precision = get_precision_requirement(seg['compartment'], seg['hierarchy'])
+            # Build steps from samples (embeddings already in Stage 1 JSONL)
+            steps = []
+            for sample in samples:
+                position = int(sample['id'].split('_')[2])
+                
+                step = {
+                    'step': position + 1,
+                    'compartment': sample['compartment'],
+                    'hierarchy': sample['hierarchical_level'],
+                    'text': sample['text'],
+                    'sonar_embedding': sample['clean_embedding'],
+                    'importance_score': sample['importance_score'],
+                    'precision': sample['precision_required']
+                }
+                steps.append(step)
             
-            steps.append({
-                "step": step_num,
-                "compartment": seg['compartment'],
-                "hierarchy": seg['hierarchy'],
-                "text": seg['text'],
-                "sonar_embedding": step_embedding,  # Always valid (never None)
-                "precision": precision,
-                "importance_score": importance
-            })
+            steps.sort(key=lambda x: x['step'])
+            
+            if len(steps) == 0:
+                continue
+            
+            metadata = doc_metadata[doc_idx]
+            
+            comp_dist = {c: sum(1 for s in steps if s['compartment'] == c) for c in VALID_COMPARTMENTS}
+            hier_dist = {h: sum(1 for s in steps if s['hierarchy'] == h) for h in VALID_HIERARCHIES}
+            avg_importance = sum(s['importance_score'] for s in steps) / len(steps)
+            
+            final_answer = '. '.join(step['text'] for step in steps) + '.'
+            
+            stage2_sample = {
+                'id': f"sft_{doc_idx:06d}",
+                'domain': metadata['domain'],
+                'query': metadata['query'],
+                'reasoning_chain': steps,
+                'final_answer': final_answer,
+                'metadata': {
+                    'num_steps': len(steps),
+                    'compartment_distribution': comp_dist,
+                    'hierarchy_distribution': hier_dist,
+                    'avg_importance': round(avg_importance, 2),
+                    'source': metadata['source'],
+                    'code_validated': False,
+                    'quality_score': 0.85
+                }
+            }
+            
+            stage2_data.append(stage2_sample)
+            processed_doc_ids.add(doc_idx)
+            processed_count += 1
+            
+            # Checkpoint every N docs
+            if processed_count % STAGE2_CHECKPOINT_INTERVAL == 0:
+                logger.info(f"\n--- STAGE 2 CHECKPOINT at {processed_count} docs ---")
+                logger.info(f"Total samples: {len(stage2_data)}")
+                
+                with open(stage2_file, 'a', encoding='utf-8', newline='') as f:
+                    for item in stage2_data[last_written_idx:]:
+                        f.write(json.dumps(item, ensure_ascii=False) + '\n')
+                
+                last_written_idx = len(stage2_data)
+                logger.info(f"✓ Appended to JSONL")
+                
+                save_checkpoint({
+                    'processed_doc_ids': list(processed_doc_ids)
+                }, 'stage2_progress')
+                
+                stage2_data = stage2_data[last_written_idx:]
+                last_written_idx = 0
+                gc.collect()
         
-        # FIX #4: Log embedding failures per doc
-        if embedding_failures_doc > 0:
-            logger.warning(f"Doc {doc_idx}: {embedding_failures_doc}/{len(data['segments'])} embeddings failed")
+        # Final write
+        if len(stage2_data) > last_written_idx:
+            with open(stage2_file, 'a', encoding='utf-8', newline='') as f:
+                for item in stage2_data[last_written_idx:]:
+                    f.write(json.dumps(item, ensure_ascii=False) + '\n')
         
-        if len(steps) >= 1:
+        logger.info(f"\n{'='*80}")
+        logger.info(f"STAGE 2 COMPLETE (JSONL MODE)")
+        logger.info(f"{'='*80}")
+        logger.info(f"Total samples: {len(processed_doc_ids)}")
+
+else:
+    # ═══ CHECKPOINT MODE: Process from doc_data (original code) ═══
+    
+    if len(processed_doc_ids) >= len(doc_data):
+        logger.info("Stage 2 already complete!")
+    else:
+        logger.info(f"Processing {len(doc_data)} documents...")
+        logger.info(f"Already processed: {len(processed_doc_ids)}")
+        
+        stage2_data = []
+        last_written_idx = 0
+        embedding_failures_total = 0
+        processed_count = len(processed_doc_ids)
+        
+        for doc_idx, data in tqdm(doc_data.items(), desc="Stage 2 Processing"):
+            if doc_idx in processed_doc_ids:
+                continue
+            
+            steps = []
+            
+            # Process segments in parallel (embeddings computed here)
+            segment_results = parallel_process_segments(data['segments'], sonar_encoder)
+            
+            for seg, step_embedding in segment_results:
+                if step_embedding is None:
+                    embedding_failures_total += 1
+                    continue
+                
+                step_num = seg['position'] + 1
+                importance = compute_importance_score(seg['text'])
+                precision = get_precision_requirement(seg['compartment'], seg['hierarchy'])
+                
+                steps.append({
+                    "step": step_num,
+                    "compartment": seg['compartment'],
+                    "hierarchy": seg['hierarchy'],
+                    "text": seg['text'],
+                    "sonar_embedding": step_embedding,
+                    "precision": precision,
+                    "importance_score": importance
+                })
+            
+            if len(steps) == 0:
+                continue
+            
             steps.sort(key=lambda x: x['step'])
             final_answer = '. '.join(step['text'] for step in steps) + '.'
             
-            comp_dist = {}
-            hier_dist = {}
-            for step in steps:
-                comp_dist[step['compartment']] = comp_dist.get(step['compartment'], 0) + 1
-                hier_dist[step['hierarchy']] = hier_dist.get(step['hierarchy'], 0) + 1
+            comp_dist = {c: sum(1 for s in steps if s['compartment'] == c) for c in VALID_COMPARTMENTS}
+            hier_dist = {h: sum(1 for s in steps if s['hierarchy'] == h) for h in VALID_HIERARCHIES}
             
             stage2_sample = {
                 "id": f"sft_{doc_idx:06d}",
@@ -885,75 +1122,42 @@ if len(processed_doc_ids) < len(doc_data):
             
             stage2_data.append(stage2_sample)
             processed_doc_ids.add(doc_idx)
+            processed_count += 1
             
-            # Sample first output
-            if len(stage2_data) == 1:
-                logger.info(f"\n{'='*60}")
-                logger.info(f"SAMPLE STAGE 2 OUTPUT (SCM COMPLIANT)")
-                logger.info(f"{'='*60}")
-                logger.info(f"ID: {stage2_sample['id']}")
-                logger.info(f"Query: {stage2_sample['query'][:200]}...")
-                logger.info(f"Steps: {len(steps)}")
-                logger.info(f"Compartment dist: {comp_dist}")
-                logger.info(f"Hierarchy dist: {hier_dist}")
-                logger.info(f"Avg importance: {stage2_sample['metadata']['avg_importance']}")
-                logger.info(f"\nFirst 2 steps (with embeddings):")
-                for step in steps[:2]:
-                    logger.info(f"  Step {step['step']} [{step['compartment']}] [{step['hierarchy']}]")
-                    logger.info(f"    Importance: {step['importance_score']}, Precision: {step['precision']}, Embedding: ✓")
-                    logger.info(f"    Text: {step['text'][:100]}...")
-                logger.info(f"{'='*60}\n")
-            
-            # FIX #12: Per-item DEBUG logging
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"--- STAGE 2 DOC {doc_idx} ---")
-                logger.debug(f"  Steps: {len(steps)}")
-                logger.debug(f"  Comp dist: {comp_dist}")
-                logger.debug(f"  Hier dist: {hier_dist}")
-                logger.debug(f"  Avg importance: {stage2_sample['metadata']['avg_importance']}")
-            
-            logger.debug(f"Doc {doc_idx}: Created Stage 2 sample with {len(steps)} steps")
-        else:
-            logger.warning(f"Doc {doc_idx}: No valid steps")
+            # Checkpoint
+            if processed_count % STAGE2_CHECKPOINT_INTERVAL == 0:
+                logger.info(f"\n--- STAGE 2 CHECKPOINT at {processed_count} docs ---")
+                
+                with open(stage2_file, 'a', encoding='utf-8', newline='') as f:
+                    for item in stage2_data[last_written_idx:]:
+                        f.write(json.dumps(item, ensure_ascii=False) + '\n')
+                
+                last_written_idx = len(stage2_data)
+                
+                save_checkpoint({
+                    'processed_doc_ids': list(processed_doc_ids)
+                }, 'stage2_progress')
+                
+                gc.collect()
         
-        processed_count += 1
-        
-        if processed_count % STAGE2_CHECKPOINT_INTERVAL == 0:
-            logger.info(f"\n--- STAGE 2 CHECKPOINT at {processed_count} docs ---")
-            logger.info(f"Total samples: {len(stage2_data)}")
-            
-            with open(stage2_file, 'a', encoding='utf-8') as f:
+        # Final write
+        if last_written_idx < len(stage2_data):
+            with open(stage2_file, 'a', encoding='utf-8', newline='') as f:
                 for item in stage2_data[last_written_idx:]:
                     f.write(json.dumps(item, ensure_ascii=False) + '\n')
-            
-            last_written_idx = len(stage2_data)
-            logger.info(f"✓ Appended to JSONL")
-            
-            save_checkpoint({
-                'stage2_data': stage2_data,
-                'processed_doc_ids': list(processed_doc_ids)
-            }, "stage2_progress")
-            
-            gc.collect()
-            logger.info("--- CHECKPOINT COMPLETE ---\n")
-    
-    if last_written_idx < len(stage2_data):
-        logger.info(f"Writing final samples...")
-        with open(stage2_file, 'a', encoding='utf-8') as f:
-            for item in stage2_data[last_written_idx:]:
-                f.write(json.dumps(item, ensure_ascii=False) + '\n')
-    
-    logger.info(f"\n{'='*80}")
-    logger.info(f"STAGE 2 COMPLETE")
-    logger.info(f"{'='*80}")
-    logger.info(f"Total samples: {len(stage2_data)}")
-    logger.info(f"Multi-step CoT: {sum(1 for d in stage2_data if d['metadata']['num_steps'] >= 2)}")
-    logger.info(f"Total embedding failures: {embedding_failures_total}")  # FIX #4
-    
-    save_checkpoint({
-        'stage2_data': stage2_data,
-        'processed_doc_ids': list(processed_doc_ids)
-    }, "stage2_progress")
+        
+        logger.info(f"\n{'='*80}")
+        logger.info(f"STAGE 2 COMPLETE (CHECKPOINT MODE)")
+        logger.info(f"{'='*80}")
+        logger.info(f"Total samples: {len(stage2_data)}")
+        logger.info(f"Embedding failures: {embedding_failures_total}")
+
+# Final checkpoint
+save_checkpoint({
+    'processed_doc_ids': list(processed_doc_ids)
+}, 'stage2_progress')
+
+logger.info("Proceeding to Stage 3...")
 
 logger.info("="*80)
 logger.info("STAGE 3: RLAIF (PREFERENCE LEARNING)")
@@ -1281,13 +1485,12 @@ Generate {num_candidates} candidates, separated by blank lines."""
     return []
 
 stage3_file = os.path.join(OUTPUT_PATH, "stage3_rlaif.jsonl")
-
 stage3_checkpoint = load_checkpoint("stage3_progress")
 
 if stage3_checkpoint:
-    stage3_data = stage3_checkpoint.get('stage3_data', [])
-    processed_query_indices = set(stage3_checkpoint.get('processed_indices', []))
-    logger.info(f"✓ Resuming Stage 3:")
+    stage3_data = stage3_checkpoint.get("stage3_data", [])
+    processed_query_indices = set(stage3_checkpoint.get("processed_indices", []))
+    logger.info(f"✓ Resuming Stage 3")
     logger.info(f"  - Samples: {len(stage3_data)}")
     logger.info(f"  - Processed: {len(processed_query_indices)}")
 else:
@@ -1295,124 +1498,149 @@ else:
     processed_query_indices = set()
     logger.info("Starting fresh Stage 3...")
 
-# FIX #11: Validate doc_data exists
+# Validate doc_data
 if not doc_data:
     doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
     if doc_data_checkpoint:
-        doc_data = doc_data_checkpoint['doc_data']
+        doc_data = doc_data_checkpoint["doc_data"]
 
 if not doc_data or len(doc_data) == 0:
-    logger.error("✗ Stage 3 requires doc_data from Stage 1/2")
+    logger.error("❌ Stage 3 requires doc_data from Stage 1/2")
     raise ValueError("Cannot proceed with Stage 3: No documents available")
 
-sample_queries = [(idx, data['query']) for idx, data in list(doc_data.items())[:5000]]
+sample_queries = [(idx, data["query"]) for idx, data in list(doc_data.items())[:5000]]
 logger.info(f"Processing {len(sample_queries)} queries")
 
 total_processed = len(processed_query_indices)
 last_written_idx = 0
 
+# Process in batches
 for batch_start in range(0, len(sample_queries), STAGE3_BATCH_SIZE):
-    batch = sample_queries[batch_start:batch_start + STAGE3_BATCH_SIZE]
-    logger.info(f"\n--- Batch {batch_start // STAGE3_BATCH_SIZE + 1} ---")
+    batch_end = min(batch_start + STAGE3_BATCH_SIZE, len(sample_queries))
+    batch = sample_queries[batch_start:batch_end]
     
+    logger.info(f"--- Batch {batch_start // STAGE3_BATCH_SIZE + 1} ({batch_start}-{batch_end}) ---")
+    
+    # Filter queries to process
+    queries_to_process = []
     for i, (doc_idx, query) in enumerate(batch):
         global_idx = batch_start + i
+        if global_idx not in processed_query_indices and query:
+            queries_to_process.append((global_idx, doc_idx, query))
+    
+    if not queries_to_process:
+        logger.info("  No new queries in this batch, skipping...")
+        continue
+    
+    logger.info(f"  Processing {len(queries_to_process)} queries in parallel...")
+    
+    # Initialize rate limiter
+    rate_limiter = RateLimitedExecutor(max_workers=STAGE3_MAX_WORKERS, 
+                                       requests_per_second=STAGE3_REQUESTS_PER_SEC)
+    
+    # Define processing function (with proper scope)
+    def process_single_query(item):
+        global_idx, doc_idx, query = item
         
-        if global_idx in processed_query_indices:
-            continue
+        logger.info(f"  Query {global_idx}: {query[:100]}...")
         
-        if not query:
-            continue
-        
-        logger.info(f"Query {global_idx}: {query[:100]}...")
-        time.sleep(0.5)
-        
-        candidates = generate_candidates_with_retry(query)
-        
-        if len(candidates) >= 2:
-            ai_feedback = {
-                "ranking": [c['candidate_id'] for c in sorted(candidates, key=lambda x: x['reward_score'], reverse=True)],
-                "criteria": {
-                    "logical_flow": [0.9, 0.8, 0.6],
-                    "accuracy": [0.95, 0.85, 0.7],
-                    "completeness": [0.9, 0.8, 0.5]
-                },
-                "critique": {c['candidate_id']: f"Quality: {c['reward_score']:.2f}" for c in candidates},
-                "preference_pairs": [
-                    {"winner": candidates[0]['candidate_id'], "loser": candidates[j]['candidate_id']}
-                    for j in range(1, len(candidates))
-                ]
-            }
+        try:
+            candidates = generate_candidates_with_retry(query)
+            time.sleep(0.5)  # Additional safety delay
             
-            stage3_sample = {
-                "id": f"rlaif_{global_idx:06d}",
-                "query": query,
-                "candidates": candidates,
-                "ai_feedback": ai_feedback,
-                "preference_pairs": ai_feedback['preference_pairs']
-            }
-            
+            if len(candidates) >= 2:
+                # Create AI feedback
+                ai_feedback = {
+                    "ranking": [c["candidate_id"] for c in sorted(candidates, 
+                                key=lambda x: x["reward_score"], reverse=True)],
+                    "criteria": {
+                        "logical_flow": [0.9, 0.8, 0.6],
+                        "accuracy": [0.95, 0.85, 0.7],
+                        "completeness": [0.9, 0.8, 0.5]
+                    },
+                    "critique": {c["candidate_id"]: f"Quality {c['reward_score']:.2f}" 
+                                for c in candidates},
+                    "preference_pairs": [
+                        {"winner": candidates[0]["candidate_id"], 
+                         "loser": candidates[j]["candidate_id"]}
+                        for j in range(1, len(candidates))
+                    ]
+                }
+                
+                stage3_sample = {
+                    "id": f"rlaif_{global_idx:06d}",
+                    "query": query,
+                    "candidates": candidates,
+                    "ai_feedback": ai_feedback,
+                    "preference_pairs": ai_feedback["preference_pairs"]
+                }
+                
+                return (global_idx, stage3_sample)
+            else:
+                logger.warning(f"  Failed for query {global_idx}: insufficient candidates")
+                return None
+                
+        except Exception as e:
+            logger.error(f"  Error processing query {global_idx}: {e}")
+            return None
+    
+    # Run in parallel
+    try:
+        results = rate_limiter.map(process_single_query, queries_to_process)
+    except Exception as e:
+        logger.error(f"Parallel processing failed: {e}")
+        results = []
+    finally:
+        rate_limiter.shutdown()
+    
+    # Process results
+    successful = 0
+    for result in results:
+        if result:
+            global_idx, stage3_sample = result
             stage3_data.append(stage3_sample)
             processed_query_indices.add(global_idx)
             total_processed += 1
-            
-            logger.info(f"✓ Created sample with {len(candidates)} candidates")
-            
-            # Sample first output
-            if len(stage3_data) == 1:
-                logger.info(f"\n{'='*60}")
-                logger.info(f"SAMPLE STAGE 3 OUTPUT (SCM COMPLIANT)")
-                logger.info(f"{'='*60}")
-                logger.info(f"Query: {query[:200]}")
-                logger.info(f"Candidates: {len(candidates)}")
-                logger.info(f"First candidate has {len(candidates[0]['reasoning_chain'])} steps")
-                logger.info(f"Steps are structured with compartments/hierarchy: ✓")
-                logger.info(f"{'='*60}\n")
-            
-            # FIX #12: Per-item DEBUG logging
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"--- STAGE 3 QUERY {global_idx} ---")
-                logger.debug(f"  Candidates: {len(candidates)}")
-                logger.debug(f"  Ranking: {ai_feedback['ranking']}")
-            
-            if total_processed % STAGE3_CHECKPOINT_INTERVAL == 0:
-                logger.info(f"\n--- STAGE 3 CHECKPOINT at {total_processed} ---")
-                
-                with open(stage3_file, 'a', encoding='utf-8') as f:
-                    for item in stage3_data[last_written_idx:]:
-                        f.write(json.dumps(item, ensure_ascii=False) + '\n')
-                
-                last_written_idx = len(stage3_data)
-                logger.info(f"✓ Appended to JSONL")
-                
-                save_checkpoint({
-                    'stage3_data': stage3_data,
-                    'processed_indices': list(processed_query_indices)
-                }, "stage3_progress")
-                
-                gc.collect()
-                logger.info("--- CHECKPOINT COMPLETE ---\n")
-        else:
-            logger.warning(f"✗ Failed for query {global_idx}")
+            successful += 1
+            logger.info(f"  ✓ Created sample for query {global_idx}")
     
-    if batch_start + STAGE3_BATCH_SIZE < len(sample_queries):
-        logger.info(f"Cooling down {STAGE3_BATCH_DELAY}s...")
+    logger.info(f"  Batch complete: {successful}/{len(queries_to_process)} successful")
+    
+    # Checkpoint every batch
+    if last_written_idx < len(stage3_data):
+        logger.info(f"  Writing {len(stage3_data) - last_written_idx} samples...")
+        with open(stage3_file, "a", encoding="utf-8") as f:
+            for item in stage3_data[last_written_idx:]:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        last_written_idx = len(stage3_data)
+        
+        save_checkpoint({
+            "stage3_data": stage3_data,
+            "processed_indices": list(processed_query_indices)
+        }, "stage3_progress")
+        
+        logger.info("  ✓ Checkpoint saved")
+    
+    # Cooling delay between batches
+    if batch_end < len(sample_queries):
+        logger.info(f"  Cooling down {STAGE3_BATCH_DELAY}s...")
         time.sleep(STAGE3_BATCH_DELAY)
 
+# Final write
 if last_written_idx < len(stage3_data):
     logger.info(f"Writing final samples...")
-    with open(stage3_file, 'a', encoding='utf-8') as f:
+    with open(stage3_file, "a", encoding="utf-8") as f:
         for item in stage3_data[last_written_idx:]:
-            f.write(json.dumps(item, ensure_ascii=False) + '\n')
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-logger.info(f"\n{'='*80}")
+logger.info("="*80)
 logger.info(f"STAGE 3 COMPLETE")
-logger.info(f"{'='*80}")
+logger.info("="*80)
 logger.info(f"Total samples: {len(stage3_data)}")
 
 save_checkpoint({
-    'stage3_data': stage3_data,
-    'processed_indices': list(processed_query_indices)
+    "stage3_data": stage3_data,
+    "processed_indices": list(processed_query_indices)
 }, "stage3_progress")
 
 logger.info("="*80)

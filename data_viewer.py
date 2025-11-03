@@ -9,7 +9,7 @@ try:
     with open(stage1_file, 'r', encoding='utf-8') as f:
         for i, item in enumerate(iterable=f,start=4):
             if i==0:
-                print(str(item)[:500])
+                print(item)
             else:
                 break
             
