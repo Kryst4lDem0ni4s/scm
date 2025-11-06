@@ -20,10 +20,10 @@ from nltk.tokenize import sent_tokenize
 
 MAX_TEXT_LENGTH = 5000  # Max chars per document to process
 MIN_SENTENCE_LENGTH = 15  # Min chars for valid sentence
-MAX_DOCS_TO_PROCESS = 50000  # Total documents to extract
-STAGE1_CHECKPOINT_INTERVAL = 50  # Docs per checkpoint
-STAGE2_CHECKPOINT_INTERVAL = 20
-STAGE3_CHECKPOINT_INTERVAL = 20
+MAX_DOCS_TO_PROCESS = 15000  # Total documents to extract
+STAGE1_CHECKPOINT_INTERVAL = 10  # Docs per checkpoint
+STAGE2_CHECKPOINT_INTERVAL = 10
+STAGE3_CHECKPOINT_INTERVAL = 10
 STAGE3_BATCH_SIZE = 10
 STAGE3_BATCH_DELAY = 30  # seconds
 DIFFUSION_T_MAX = 40  # Max timestep for diffusion noise
@@ -382,20 +382,24 @@ def extract_text_from_conversations(example):
     return ' '.join(texts).strip() if texts else example.get('text', '')
 
 def estimate_compartment_advanced(text):
-    """
-    Rule-based compartment labeling with science-focused patterns.
-    
-    NOTE: Known limitation - 60-70% accuracy.
-    """
     text_lower = text.lower()
     
-    factual_indicators = ['is', 'are', 'was', 'were', 'defined as', 'equals', 
-                         'known as', 'theorem', 'law', 'formula', 'equation']
-    procedural_indicators = ['step', 'first', 'then', 'algorithm', 'calculate', 
-                           'solve', 'implement', 'process']
-    episodic_indicators = ['discovered', 'developed by', 'introduced', 'published', 'historical']
-    contextual_indicators = ['important', 'application', 'example', 'advantage']
-    conceptual_indicators = ['therefore', 'thus', 'concept', 'theory', 'implies']
+    # Check for procedural keywords first (highest priority)
+    procedural_strong = ['algorithm', 'calculate', 'solve', 'implement', 'derive', 'compute']
+    if any(kw in text_lower for kw in procedural_strong):
+        return 'PROCEDURAL'
+    
+    # Check for episodic keywords
+    episodic_strong = ['discovered', 'developed by', 'published', 'introduced in']
+    if any(kw in text_lower for kw in episodic_strong):
+        return 'EPISODIC'
+    
+    # Score-based fallback
+    factual_indicators = ['defined as', 'equals', "=", "/", "sqrt", "{", "(", "%", "\\", "+", "(g)", "element", "chemical", "ion", "molecule", "bond", "mixture", 'known as', 'theorem', 'law', 'formula', 'equation', "compound", "solution", "area", "density", "volume", "weight", "litre", "kg", "nano", "gram", "°", "degree", "^", "$", "MHz", "known as", "volt", "watt", "term is", "answer is"]
+    procedural_indicators = ['step', 'first', 'then', 'calculate', 'solve', 'process', "what", "next", "via", "how", "data", "start", "end", "last", "procedure", "learn", "calculate", "interpret", "explain", "leads"]
+    episodic_indicators = ['discovered', 'developed by', 'introduced', 'published', 'historical', "remember" "why", "try", "know", "recall", "used to", "said", "happened", "occurred", "consider", "background", "figure out", "has to", "seen"]
+    contextual_indicators = ['important', 'application', 'example', 'advantage', 'because', "can be", "idea", "occur", "mean", "by the way", "information", "context", "what are", "known that"]
+    conceptual_indicators = ['therefore', 'concept', 'theory', 'implies', 'suggests', "let me", "think", "I know", "I'm", "wonder", "feel", "seem", "should", "concept", "fortunately", "okay", "break it down", "Hmm", "right?", "I was", "I did", "I will", "I know", "I can", "I need", "I should", "I am" "myself", "need to", "think about", "look at", "my reasoning", "I could", "In my", "I've"]
     
     scores = {
         'FACTUAL': sum(1 for p in factual_indicators if p in text_lower),
@@ -405,26 +409,227 @@ def estimate_compartment_advanced(text):
         'CONCEPTUAL': sum(1 for p in conceptual_indicators if p in text_lower)
     }
     
+    # ✅ Add science term bonus
+    science_terms = extract_technical_terms(text)
+    if len(science_terms) >= 2:
+        scores['FACTUAL'] += 1  # Science-heavy text is often factual
+    
     max_comp = max(scores, key=scores.get)
-    return max_comp if scores[max_comp] > 0 else 'CONCEPTUAL'
+    
+    # ✅ Better default logic
+    if scores[max_comp] == 0:
+        # If no indicators, use length heuristic
+        return 'FACTUAL' if len(text) < 100 else 'CONCEPTUAL'
+    
+    return max_comp
 
-def determine_hierarchy(text):
+def determine_hierarchy(text, compartment):
     """
-    Determine hierarchical level based on length and technical density.
+    Determine hierarchical level based on semantic abstraction and context.
     
-    - GRANULAR: Detailed facts, specific procedures (<50 chars or high tech density)
-    - INTERMEDIATE: General concepts, broader procedures (50-150 chars, medium density)
-    - GENERAL: High-level summaries, abstract concepts (>150 chars, low density)
+    GRANULAR: Specific details, exact values, concrete facts
+    - Code snippets, variable values, specific numbers
+    - Exact process steps with parameters
+    - Precise specifications, configurations, settings
+    - Atomic facts (e.g., "Water boils at 100°C")
+    
+    INTERMEDIATE: Reasoning, explanations, transitional logic
+    - Thinking steps, logical connections
+    - Explanations of concepts or processes
+    - Inference, consequences, implications
+    - Contextual reasoning (e.g., "Because X, therefore Y")
+    
+    GENERAL: Broad concepts, high-level summaries, abstractions
+    - Abstract principles, conceptual frameworks
+    - High-level overviews, summaries
+    - General understanding, layman explanations
+    - Philosophical or theoretical statements
+    
+    Args:
+        text: The sentence/segment to classify
+        compartment: The compartment label (affects hierarchy interpretation)
+    
+    Returns:
+        str: 'GRANULAR', 'INTERMEDIATE', or 'GENERAL'
     """
-    length = len(text)
-    tech_terms = ['neural', 'gradient', 'algorithm', 'equation', 'derivative', 'probability', 'matrix']
-    tech_density = sum(1 for term in tech_terms if term in text.lower()) / max(len(text.split()), 1)
+    text_lower = text.lower()
     
-    if length < 50 or tech_density > 0.1:
+    # ═══════════════════════════════════════════════════════════════
+    # GRANULAR INDICATORS: Specificity markers
+    # ═══════════════════════════════════════════════════════════════
+    
+    granular_indicators = [
+        # Numeric/measurement specificity
+        r'\b\d+\.?\d*\s*(°C|°F|K|m|cm|mm|kg|g|mg|L|mL|Hz|MHz|GHz|V|A|W|Ω|Pa|atm|mol|M)\b',  # Units
+        r'\b\d+\.?\d*\s*(percent|%)\b',  # Percentages
+        r'\b\d{4}\b',  # Years (e.g., "1995", "2024")
+        r'\b\d+:\d+\b',  # Ratios (e.g., "3:1")
+        
+        # Code/variable markers
+        r'`[^`]+`',  # Inline code
+        r'\b[a-z_][a-z0-9_]*\s*=\s*',  # Variable assignment (x = ...)
+        r'\bdef\s+\w+\(',  # Function definition
+        r'\bclass\s+\w+',  # Class definition
+        
+        # Exact specifications
+        r'\b(exactly|precisely|specifically|namely|i\.e\.|e\.g\.)\b',
+        r'\bstep\s+\d+',  # "Step 1", "Step 2"
+        r'\bfigure\s+\d+',  # "Figure 3"
+        r'\bequation\s+\d+',  # "Equation 5"
+        r'\btable\s+\d+',  # "Table 2"
+    ]
+    
+    # Count granular markers
+    granular_score = sum(1 for pattern in granular_indicators if re.search(pattern, text_lower))
+    
+    # Additional heuristics
+    has_numbers = bool(re.search(r'\d', text))  # Contains any digit
+    has_formula = bool(re.search(r'[=+\-*/^]', text))  # Math operators
+    has_chemical_formula = bool(re.search(r'\b[A-Z][a-z]?\d*', text))  # H2O, CO2, etc.
+    has_citation = bool(re.search(r'\[\d+\]|\(\d{4}\)', text))  # [1], (2023)
+    
+    if has_numbers:
+        granular_score += 1
+    if has_formula:
+        granular_score += 1
+    if has_chemical_formula and compartment == 'FACTUAL':
+        granular_score += 1
+    if has_citation:
+        granular_score += 0.5
+    
+    # ═══════════════════════════════════════════════════════════════
+    # INTERMEDIATE INDICATORS: Reasoning and explanation
+    # ═══════════════════════════════════════════════════════════════
+    
+    intermediate_indicators = [
+        # Reasoning transitions
+        r'\b(because|since|therefore|thus|hence|consequently|as a result)\b',
+        r'\b(if|when|while|although|unless|provided that)\b',
+        r'\b(leads to|results in|causes|implies|suggests|indicates)\b',
+        
+        # Explanation markers
+        r'\b(explains|clarifies|demonstrates|illustrates|shows that)\b',
+        r'\b(in other words|that is|meaning|which means)\b',
+        r'\b(can be understood as|refers to|relates to)\b',
+        
+        # Thinking/logic markers
+        r'\b(consider|observe|note that|recall that|remember)\b',
+        r'\b(follows that|we can see|it is clear|it becomes apparent)\b',
+        r'\b(inference|deduction|reasoning|logic)\b',
+        
+        # Comparison/contrast
+        r'\b(compared to|in contrast|similarly|likewise|whereas)\b',
+        r'\b(on the other hand|conversely|however|but)\b',
+    ]
+    
+    intermediate_score = sum(1 for pattern in intermediate_indicators if re.search(pattern, text_lower))
+    
+    # Additional heuristics
+    has_transition_words = bool(re.search(r'\b(first|second|next|then|finally|additionally)\b', text_lower))
+    has_explanation_structure = bool(re.search(r'\b(why|how|what|which)\b', text_lower))
+    
+    if has_transition_words:
+        intermediate_score += 0.5
+    if has_explanation_structure:
+        intermediate_score += 0.5
+    
+    # ═══════════════════════════════════════════════════════════════
+    # GENERAL INDICATORS: Abstraction and high-level concepts
+    # ═══════════════════════════════════════════════════════════════
+    
+    general_indicators = [
+        # Abstract concepts
+        r'\b(concept|principle|theory|framework|paradigm|philosophy)\b',
+        r'\b(generally|broadly|overall|in general|typically|usually)\b',
+        r'\b(fundamental|essential|core|basic|primary|key)\b',
+        
+        # High-level summaries
+        r'\b(summary|overview|introduction|conclusion|essence|gist)\b',
+        r'\b(in summary|to summarize|in conclusion|overall)\b',
+        
+        # Philosophical/theoretical
+        r'\b(nature of|essence of|meaning of|significance of)\b',
+        r'\b(understanding|perspective|viewpoint|approach|conception)\b',
+        r'\b(can be thought of as|is essentially|fundamentally)\b',
+        
+        # Layman/simplified explanations
+        r'\b(simply put|in simple terms|basically|essentially)\b',
+        r'\b(common understanding|general knowledge|widely known)\b',
+    ]
+    
+    general_score = sum(1 for pattern in general_indicators if re.search(pattern, text_lower))
+    
+    # Length-based abstraction heuristic
+    word_count = len(text.split())
+    if word_count > 30:  # Long sentences tend to be more abstract
+        general_score += 0.5
+    
+    # ═══════════════════════════════════════════════════════════════
+    # COMPARTMENT-AWARE DECISION LOGIC
+    # ═══════════════════════════════════════════════════════════════
+    
+    if compartment == 'FACTUAL':
+        # Factual statements: Specificity = granular, generalizations = general
+        if granular_score >= 2:
+            return 'GRANULAR'
+        elif general_score >= 2:
+            return 'GENERAL'
+        elif intermediate_score >= 1:
+            return 'INTERMEDIATE'
+        else:
+            # Default for facts: If short and specific → granular, if long → intermediate
+            return 'GRANULAR' if word_count < 15 else 'INTERMEDIATE'
+    
+    elif compartment == 'PROCEDURAL':
+        # Procedures: Exact steps = granular, process overview = general
+        if granular_score >= 1.5 or 'step' in text_lower:
+            return 'GRANULAR'
+        elif general_score >= 2:
+            return 'GENERAL'
+        else:
+            return 'INTERMEDIATE'
+    
+    elif compartment == 'EPISODIC':
+        # Historical/episodic: Specific dates/people = granular, context = intermediate
+        if granular_score >= 1.5:
+            return 'GRANULAR'
+        elif general_score >= 2:
+            return 'GENERAL'
+        else:
+            return 'INTERMEDIATE'
+    
+    elif compartment in ['CONTEXTUAL', 'CONCEPTUAL']:
+        # Context/concepts: Rarely granular, often intermediate or general
+        if granular_score >= 3:  # Very high threshold for abstract compartments
+            return 'GRANULAR'
+        elif general_score >= 1.5:
+            return 'GENERAL'
+        elif intermediate_score >= 1:
+            return 'INTERMEDIATE'
+        else:
+            return 'GENERAL'  # Default for abstract compartments
+    
+    # ═══════════════════════════════════════════════════════════════
+    # FALLBACK LOGIC: Score-based decision
+    # ═══════════════════════════════════════════════════════════════
+    
+    max_score = max(granular_score, intermediate_score, general_score)
+    
+    if max_score == 0:
+        # No indicators found - use length heuristic
+        if word_count < 10:
+            return 'GRANULAR'  # Very short = likely specific fact
+        elif word_count < 25:
+            return 'INTERMEDIATE'
+        else:
+            return 'GENERAL'
+    
+    if granular_score == max_score:
         return 'GRANULAR'
-    elif length < 150 or tech_density > 0.05:
+    elif intermediate_score == max_score:
         return 'INTERMEDIATE'
-    return 'GENERAL'
+    else:
+        return 'GENERAL'
 
 def get_precision_requirement(compartment, hierarchy):
     """
@@ -435,10 +640,12 @@ def get_precision_requirement(compartment, hierarchy):
     - PROCEDURAL: FP32 (granular), FP16 (intermediate/general)
     - EPISODIC/CONTEXTUAL/CONCEPTUAL: FP16 throughout
     """
+    if hierarchy == 'GRANULAR':
+        return 'fp32'
     if compartment == 'FACTUAL':
         return 'fp32'
-    elif compartment == 'PROCEDURAL':
-        return 'fp32' if hierarchy == 'GRANULAR' else 'fp16'
+    elif compartment == 'PROCEDURAL' or compartment == 'CONTEXTUAL':
+        return 'fp32' if hierarchy == 'INTERMEDIATE' or hierarchy == 'GRANULAR' else 'fp16'
     else:
         return 'fp16'
 
@@ -582,13 +789,43 @@ for example in tqdm(science_dataset_stream, desc="Stage 1 Processing", total=MAX
             continue
         
         comp = estimate_compartment_advanced(sent)
-        hier = determine_hierarchy(sent)
+        hier = determine_hierarchy(sent, comp)  # ✅ Pass compartment
+        
+        # ✅ Generate embedding HERE (before appending to segments)
+        try:
+            segment_embedding = sonar_encoder.encode(sent.strip())
+            if isinstance(segment_embedding, np.ndarray):
+                segment_embedding = segment_embedding.tolist()
+            elif hasattr(segment_embedding, 'tolist'):
+                segment_embedding = segment_embedding.tolist()
+            elif hasattr(segment_embedding, 'cpu'):  # PyTorch tensor
+                segment_embedding = segment_embedding.cpu().numpy().tolist()
+            elif hasattr(segment_embedding, 'numpy'):  # TF tensor
+                segment_embedding = segment_embedding.numpy().tolist()
+            else:
+                # Last resort: convert to numpy first
+                segment_embedding = np.array(segment_embedding).tolist()
+                
+            if not isinstance(segment_embedding, list):
+                raise TypeError(f"Embedding is {type(segment_embedding)}, expected list")
+            
+        except Exception as e:
+            logger.warning(f"Doc {global_idx}, Seg {i}: Embedding failed - {e}")
+            logger.warning(f"Embedding logic failed! Pause pipeline and fix.")
+            continue  # Skip segment if embedding fails
+        
+        if len(segment_embedding) != 1024:
+            logger.error(f"Doc {global_idx}, Seg {i}: Embedding dimension is {len(segment_embedding)}, expected 1024")
+            logger.error("CRITICAL: SCM compliance violated! Pausing pipeline.")
+            raise ValueError(f"Embedding dimension mismatch: {len(segment_embedding)} vs 1024")
+
         
         segments.append({
             'text': sent.strip(),
             'compartment': comp,
             'hierarchy': hier,
-            'position': i
+            'position': i,
+            'sonar_embedding': segment_embedding  # ✅ Store embedding
         })
     
     if segments:
@@ -632,12 +869,15 @@ for example in tqdm(science_dataset_stream, desc="Stage 1 Processing", total=MAX
         for seg in segments:
             try:
                 # Generate clean embedding (1024-dim)
-                clean_embedding = sonar_encoder.encode(seg['text'])
+                clean_embedding = seg['sonar_embedding']
                 
-                if hasattr(clean_embedding, 'tolist'):
-                    clean_embedding = clean_embedding.tolist()
-                elif isinstance(clean_embedding, np.ndarray):
-                    clean_embedding = clean_embedding.tolist()
+                if not isinstance(clean_embedding, list):
+                    if hasattr(clean_embedding, 'tolist'):
+                        clean_embedding = clean_embedding.tolist()
+                    elif isinstance(clean_embedding, np.ndarray):
+                        clean_embedding = clean_embedding.tolist()
+                    else:
+                        raise TypeError(f"Invalid embedding type: {type(clean_embedding)}")
                 
                 # Apply diffusion noise
                 noisy_embedding, timestep, alpha_t = apply_diffusion_noise(clean_embedding)
@@ -655,7 +895,8 @@ for example in tqdm(science_dataset_stream, desc="Stage 1 Processing", total=MAX
             stage1_sample = {
                 "id": f"pretrain_{global_idx:06d}_{seg['position']}",
                 "text": seg['text'],
-                "clean_embedding": clean_embedding,
+                # "clean_embedding": clean_embedding,
+                "clean_embedding": seg['sonar_embedding'],  # ✅ Reuse from segment
                 "noisy_embedding": noisy_embedding,
                 "timestep": timestep,
                 "alpha_t": alpha_t,
@@ -694,7 +935,7 @@ for example in tqdm(science_dataset_stream, desc="Stage 1 Processing", total=MAX
             
             # Lightweight checkpoint (metadata only for speed)
             checkpoint_meta = {
-                'doc_data': {k: {**v, 'segments': []} for k, v in doc_data.items()},
+                'doc_data': doc_data,
                 'stage1_data': [],
                 'doc_count': doc_count,
                 'science_count': science_count,
@@ -709,14 +950,13 @@ for example in tqdm(science_dataset_stream, desc="Stage 1 Processing", total=MAX
             stage1_file = os.path.join(OUTPUT_PATH, "stage1_pretrain.jsonl")
             with open(stage1_file, 'a', encoding='utf-8') as f:
                 for item in stage1_data[last_written_stage1_idx:]:
-                    f.write(json.dumps(item, ensure_ascii=False))
+                    f.write(json.dumps(item, ensure_ascii=False) + '\n')
             
             # FIX #1: Update tracker
             written_count = len(stage1_data) - last_written_stage1_idx
             logger.info(f"Appended {written_count} new samples to Stage 1 JSONL")
-
-            # Clear memory:
-            stage1_data.clear()  # Clear all (everything written to file)
+            
+            stage1_data.clear() # Keep unwritten
             last_written_stage1_idx = 0  # Reset tracker for next batch
             gc.collect()
             logger.info(f"Memory freed (retained {len(stage1_data)} unwritten samples)")
@@ -795,6 +1035,25 @@ if not doc_data or len(doc_data) == 0:
     logger.error("✗ No doc_data found! Stage 1 must be completed first.")
     logger.error("Expected checkpoint: stage1_processing.pkl or doc_data_for_stage2.pkl")
     raise ValueError("Cannot proceed with Stage 2: No doc_data available")
+
+sample_doc = doc_data[list(doc_data.keys())[0]]
+if 'segments' in sample_doc and len(sample_doc['segments']) > 0:
+    sample_seg = sample_doc['segments'][0]
+    
+    if 'sonar_embedding' not in sample_seg:
+        logger.error("❌ CRITICAL: Checkpoint has old format (missing sonar_embedding)")
+        logger.error("  Loaded doc_data does NOT contain embeddings in segments")
+        logger.error("  You MUST regenerate Stage 1 with fixed code")
+        raise ValueError("Incompatible checkpoint: Missing embeddings in segments")
+    
+    # Check dimension
+    emb_dim = len(sample_seg['sonar_embedding'])
+    if emb_dim != 1024:
+        logger.error(f"❌ CRITICAL: Embeddings are {emb_dim}-dim, expected 1024")
+        raise ValueError(f"SCM compliance violated: {emb_dim}-dim embeddings")
+    
+    logger.info("✅ doc_data validated: Segments contain 1024-dim embeddings")
+
 
 logger.info(f"✓ doc_data ready for Stage 2: {len(doc_data)} documents")
 logger.info("="*80)
@@ -888,13 +1147,6 @@ if len(processed_doc_ids) < len(doc_data):
     last_written_idx = 0
     embedding_failures_total = 0  # FIX #4: Track failures
     
-    for i, (doc_idx, data) in enumerate(tqdm(doc_data.items(), desc="Stage 2 Processing")):
-        if doc_idx in processed_doc_ids:
-            logger.debug(f"Doc {doc_idx}: Already processed")
-            processed_count += 1
-            continue
-        
-    
     # FIX #11: Validate doc_data exists
     if not doc_data:
         doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
@@ -929,10 +1181,19 @@ if len(processed_doc_ids) < len(doc_data):
         logger.info(f"Processing {len(data['segments'])} segments in parallel...")
 
         # Process all segments in parallel
-        segment_results = parallel_process_segments(data['segments'], sonar_encoder)
+        # segment_results = parallel_process_segments(data['segments'], sonar_encoder)
 
-        for seg, step_embedding in segment_results:
+        # for seg, step_embedding in segment_results:
+        for seg in data['segments']:
             step_num = seg['position'] + 1
+            
+            if 'sonar_embedding' not in seg:
+                logger.warning(f"Doc {doc_idx}, Step {step_num}: Missing embedding in segment")
+                embedding_failures_doc += 1
+                embedding_failures_total += 1
+                continue
+            
+            step_embedding = seg['sonar_embedding']
             
             if step_embedding is None:
                 logger.warning(f"Doc {doc_idx}, Step {step_num}: Embedding failed")
@@ -940,6 +1201,16 @@ if len(processed_doc_ids) < len(doc_data):
                 embedding_failures_total += 1
                 continue
             
+            if not isinstance(step_embedding, list):
+                logger.warning(f"Doc {doc_idx}, Step {step_num}: Embedding not a list")
+                embedding_failures_doc += 1
+                continue
+            
+            if len(step_embedding) != 1024:
+                logger.warning(f"Doc {doc_idx}, Step {step_num}: Embedding dimension {len(step_embedding)} != 1024")
+                embedding_failures_doc += 1
+                continue
+                    
             importance = compute_importance_score(seg['text'])
             precision = get_precision_requirement(seg['compartment'], seg['hierarchy'])
             
@@ -1301,9 +1572,11 @@ def generate_candidates_with_retry(query, num_candidates=3, model=OLLAMA_MODEL, 
             prompt = f"""Generate {num_candidates} different step-by-step science explanations for: {query}
 
 CRITICAL FORMAT (use EXACTLY as shown):
-Step 1 [FACTUAL] [GRANULAR]: explanation text here
+Step 1 [FACTUAL] [GRANULAR]: key information text here
 Step 2 [PROCEDURAL] [INTERMEDIATE]: process text here
-Step 3 [CONCEPTUAL] [GENERAL]: conclusion text here
+Step 3 [EPISODIC] [GENERAL]: reasoning text here
+Step 4 [CONTEXTUAL] [INTERMEDIATE]: contextual information text here
+Step 5 [CONCEPTUAL] [GENERAL]: conclusion text here
 Final Answer: complete answer here
 
 RULES:
@@ -1311,6 +1584,7 @@ RULES:
 - Always include BOTH compartment AND hierarchy
 - Always end brackets with a colon :
 - No extra spaces inside brackets
+- Divide answer into 'n' steps.
 - Valid compartments: FACTUAL, PROCEDURAL, EPISODIC, CONTEXTUAL, CONCEPTUAL
 - Valid hierarchies: GRANULAR, INTERMEDIATE, GENERAL
 
@@ -1404,7 +1678,8 @@ if not doc_data or len(doc_data) == 0:
     logger.error("❌ Stage 3 requires docdata from Stage 1/2")
     raise ValueError("Cannot proceed with Stage 3: No documents available")
 
-sample_queries = [(idx, data["query"]) for idx, data in list(doc_data.items())[:5000]]
+
+sample_queries = [(idx, data["query"]) for idx, data in doc_data.items()]
 logger.info(f"Processing {len(sample_queries)} queries")
 
 total_processed = len(processed_query_indices)
