@@ -1,7 +1,6 @@
-CHECKPOINT_DIR = "C:/Users/Khwaish/Google Drive Streaming/My Drive/scm_project/checkpoints/stage1_processing.pkl"
-
+CHECKPOINT_DIR = "C:/Users/Khwaish/Google Drive Streaming/My Drive/scm_project/checkpoints"
 import pickle
-with open('checkpoints/stage1_processing.pkl', 'rb') as f:
+with open('C:/Users/Khwaish/Google Drive Streaming/My Drive/scm_project/checkpoints/stage1_processing.pkl', 'rb') as f:
     data = pickle.load(f)
 
 # Check doc_data has segments

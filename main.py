@@ -20,13 +20,13 @@ from nltk.tokenize import sent_tokenize
 
 MAX_TEXT_LENGTH = 5000  # Max chars per document to process
 MIN_SENTENCE_LENGTH = 15  # Min chars for valid sentence
-MAX_DOCS_TO_PROCESS = 15000  # Total documents to extract
+MAX_DOCS_TO_PROCESS = 12000  # Total documents to extract
 STAGE1_CHECKPOINT_INTERVAL = 10  # Docs per checkpoint
 STAGE2_CHECKPOINT_INTERVAL = 10
 STAGE3_CHECKPOINT_INTERVAL = 10
 STAGE3_BATCH_SIZE = 10
 STAGE3_BATCH_DELAY = 30  # seconds
-DIFFUSION_T_MAX = 40  # Max timestep for diffusion noise
+DIFFUSION_T_MAX = 40  # Max timestep for diffusion noise6
 DIFFUSION_SIGMA_MIN = 0.02
 DIFFUSION_SIGMA_MAX = 0.5
 
@@ -399,7 +399,7 @@ def estimate_compartment_advanced(text):
     procedural_indicators = ['step', 'first', 'then', 'calculate', 'solve', 'process', "what", "next", "via", "how", "data", "start", "end", "last", "procedure", "learn", "calculate", "interpret", "explain", "leads"]
     episodic_indicators = ['discovered', 'developed by', 'introduced', 'published', 'historical', "remember" "why", "try", "know", "recall", "used to", "said", "happened", "occurred", "consider", "background", "figure out", "has to", "seen"]
     contextual_indicators = ['important', 'application', 'example', 'advantage', 'because', "can be", "idea", "occur", "mean", "by the way", "information", "context", "what are", "known that"]
-    conceptual_indicators = ['therefore', 'concept', 'theory', 'implies', 'suggests', "let me", "think", "I know", "I'm", "wonder", "feel", "seem", "should", "concept", "fortunately", "okay", "break it down", "Hmm", "right?", "I was", "I did", "I will", "I know", "I can", "I need", "I should", "I am" "myself", "need to", "think about", "look at", "my reasoning", "I could", "In my", "I've"]
+    conceptual_indicators = ['therefore', 'concept', 'theory', 'implies', 'suggests', "let me", "think", "I know", "I'm", "wonder", "feel", "seem", "should", "concept", "fortunately", "okay", "break it down", "Hmm", "right?", "I was", "I did", "I will", "I know", "I can", "I need", "I should", "I am" "myself", "need to", "think about", "look at", "my reasoning", "I could", "In my", "I've", "okay, so"]
     
     scores = {
         'FACTUAL': sum(1 for p in factual_indicators if p in text_lower),
@@ -409,17 +409,12 @@ def estimate_compartment_advanced(text):
         'CONCEPTUAL': sum(1 for p in conceptual_indicators if p in text_lower)
     }
     
-    # ✅ Add science term bonus
-    science_terms = extract_technical_terms(text)
-    if len(science_terms) >= 2:
-        scores['FACTUAL'] += 1  # Science-heavy text is often factual
-    
     max_comp = max(scores, key=scores.get)
     
     # ✅ Better default logic
     if scores[max_comp] == 0:
         # If no indicators, use length heuristic
-        return 'FACTUAL' if len(text) < 100 else 'CONCEPTUAL'
+        return 'CONTEXTUAL' or 'FACTUAL' if len(text) < 100 else 'CONCEPTUAL' or "EPISODIC" or "PROCEDURAL"
     
     return max_comp
 
