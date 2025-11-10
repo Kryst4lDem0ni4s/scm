@@ -70,7 +70,7 @@ setup_cuda()
 
 # Force CUDA as default device
 torch.set_default_device('cuda')
-print(f"Default device: {torch.get_default_device()}")
+# print(f"Default device: {torch.get_default_device()}")
 
 # ═══════════════════════════════════════════════════════════════════
 # CONFIGURATION

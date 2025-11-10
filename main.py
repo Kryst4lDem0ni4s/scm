@@ -1,5 +1,6 @@
 
 import time
+from typing import Any, Dict, List, Optional
 import requests
 import re
 import os
@@ -21,10 +22,10 @@ from nltk.tokenize import sent_tokenize
 MAX_TEXT_LENGTH = 5000  # Max chars per document to process
 MIN_SENTENCE_LENGTH = 15  # Min chars for valid sentence
 MAX_DOCS_TO_PROCESS = 12000  # Total documents to extract
-STAGE1_CHECKPOINT_INTERVAL = 10  # Docs per checkpoint
-STAGE2_CHECKPOINT_INTERVAL = 10
-STAGE3_CHECKPOINT_INTERVAL = 10
-STAGE3_BATCH_SIZE = 10
+STAGE1_CHECKPOINT_INTERVAL = 30  # Docs per checkpoint
+STAGE2_CHECKPOINT_INTERVAL = 500
+STAGE3_CHECKPOINT_INTERVAL = 3
+STAGE3_BATCH_SIZE = 3
 STAGE3_BATCH_DELAY = 30  # seconds
 DIFFUSION_T_MAX = 40  # Max timestep for diffusion noise6
 DIFFUSION_SIGMA_MIN = 0.02
@@ -44,7 +45,7 @@ STAGE3_REQUESTS_PER_SEC = 2  # Ollama rate limit (adjust based on your setup)
 VALID_COMPARTMENTS = {'FACTUAL', 'PROCEDURAL', 'EPISODIC', 'CONTEXTUAL', 'CONCEPTUAL'}
 VALID_HIERARCHIES = {'GRANULAR', 'INTERMEDIATE', 'GENERAL'}
 
-LOG_DIR = "C:/Users/Khwaish/Google Drive Streaming/My Drive/scm_project/logs"
+LOG_DIR = "G:/My Drive/scm_project/logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -67,7 +68,7 @@ logger.info(f"Architecture: Small Concept Model (SCM)")
 logger.info(f"Max docs to process: {MAX_DOCS_TO_PROCESS}")
 logger.info("="*80)
 
-NLTK_CACHE = 'C:/Users/Khwaish/Google Drive Streaming/My Drive/scm_project/cache/nltk'
+NLTK_CACHE = 'G:/My Drive/scm_project/cache/nltk'
 os.makedirs(NLTK_CACHE, exist_ok=True)
 
 logger.info("Setting up NLTK...")
@@ -87,7 +88,7 @@ try:
 except Exception as e:
     logger.warning(f"punkt_tab download failed (may not be critical): {e}")
 
-BASE_PATH = "C:/Users/Khwaish/Google Drive Streaming/My Drive/scm_project"
+BASE_PATH = "G:/My Drive/scm_project"
 CACHE_PATH = os.path.join(BASE_PATH, "cache/datasets")
 OUTPUT_PATH = os.path.join(BASE_PATH, "datasets/processed")
 CHECKPOINT_DIR = os.path.join(BASE_PATH, "checkpoints")
@@ -716,290 +717,290 @@ logger.info("Applying science content filter...")
 science_dataset_stream = dataset.filter(is_science_content)
 logger.info("✓ Science filter applied")
 
-logger.info("="*80)
-logger.info("STAGE 1: PRE-TRAINING DATA GENERATION")
-logger.info("SCM Compliance: 1024-dim embeddings + diffusion noise")
-logger.info("="*80)
+# logger.info("="*80)
+# logger.info("STAGE 1: PRE-TRAINING DATA GENERATION")
+# logger.info("SCM Compliance: 1024-dim embeddings + diffusion noise")
+# logger.info("="*80)
 
-checkpoint_data = load_checkpoint("stage1_processing")
+# checkpoint_data = load_checkpoint("stage1_processing")
 
-if checkpoint_data:
-    doc_data = checkpoint_data.get('doc_data', {})
-    stage1_data = checkpoint_data.get('stage1_data', [])
-    doc_count = checkpoint_data.get('doc_count', 0)
-    science_count = checkpoint_data.get('science_count', 0)
-    last_processed_idx = checkpoint_data.get('last_idx', -1)
+# if checkpoint_data:
+#     doc_data = checkpoint_data.get('doc_data', {})
+#     stage1_data = checkpoint_data.get('stage1_data', [])
+#     doc_count = checkpoint_data.get('doc_count', 0)
+#     science_count = checkpoint_data.get('science_count', 0)
+#     last_processed_idx = checkpoint_data.get('last_idx', -1)
     
-    logger.info(f"✓ Resuming from checkpoint:")
-    logger.info(f"  - Processed docs: {doc_count}")
-    logger.info(f"  - Stage 1 samples: {len(stage1_data)}")
-    logger.info(f"  - Last global index: {last_processed_idx}")
-else:
-    doc_data = {}
-    stage1_data = []
-    doc_count = 0
-    science_count = 0
-    last_processed_idx = -1
-    logger.info("Starting fresh Stage 1 processing...")
+#     logger.info(f"✓ Resuming from checkpoint:")
+#     logger.info(f"  - Processed docs: {doc_count}")
+#     logger.info(f"  - Stage 1 samples: {len(stage1_data)}")
+#     logger.info(f"  - Last global index: {last_processed_idx}")
+# else:
+#     doc_data = {}
+#     stage1_data = []
+#     doc_count = 0
+#     science_count = 0
+#     last_processed_idx = -1
+#     logger.info("Starting fresh Stage 1 processing...")
 
-logger.info(f"Processing up to {MAX_DOCS_TO_PROCESS} science docs...")
-logger.info(f"Checkpoint interval: every {STAGE1_CHECKPOINT_INTERVAL} docs")
+# logger.info(f"Processing up to {MAX_DOCS_TO_PROCESS} science docs...")
+# logger.info(f"Checkpoint interval: every {STAGE1_CHECKPOINT_INTERVAL} docs")
 
-# FIX #1 & #2: Track last written position for incremental append
-last_written_stage1_idx = 0
+# # FIX #1 & #2: Track last written position for incremental append
+# last_written_stage1_idx = 0
 
-# FIX #14: Skip already-processed documents efficiently
-if last_processed_idx >= 0:
-    logger.info(f"Skipping {last_processed_idx + 1} already-processed documents...")
-    science_dataset_stream = science_dataset_stream.skip(last_processed_idx + 1)
-    global_idx = last_processed_idx + 1
-else:
-    global_idx = 0
+# # FIX #14: Skip already-processed documents efficiently
+# if last_processed_idx >= 0:
+#     logger.info(f"Skipping {last_processed_idx + 1} already-processed documents...")
+#     science_dataset_stream = science_dataset_stream.skip(last_processed_idx + 1)
+#     global_idx = last_processed_idx + 1
+# else:
+#     global_idx = 0
 
-docs_processed_this_run = 0
+# docs_processed_this_run = 0
 
-for example in tqdm(science_dataset_stream, desc="Stage 1 Processing", total=MAX_DOCS_TO_PROCESS - global_idx):
-    if doc_count >= MAX_DOCS_TO_PROCESS:
-        logger.info(f"Reached MAX_DOCS_TO_PROCESS limit ({MAX_DOCS_TO_PROCESS}). Stopping.")
-        break
+# for example in tqdm(science_dataset_stream, desc="Stage 1 Processing", total=MAX_DOCS_TO_PROCESS - global_idx):
+#     if doc_count >= MAX_DOCS_TO_PROCESS:
+#         logger.info(f"Reached MAX_DOCS_TO_PROCESS limit ({MAX_DOCS_TO_PROCESS}). Stopping.")
+#         break
     
-    full_text = extract_text_from_conversations(example)
-    if not full_text or len(full_text) < 20:
-        logger.debug(f"Doc {global_idx}: Skipped (text too short)")
-        global_idx += 1
-        continue
+#     full_text = extract_text_from_conversations(example)
+#     if not full_text or len(full_text) < 20:
+#         logger.debug(f"Doc {global_idx}: Skipped (text too short)")
+#         global_idx += 1
+#         continue
     
-    query = ""
-    conversations = example.get('conversations', [])
-    for conv in conversations:
-        if 'user' in str(conv.get('from', '')).lower():
-            query = conv.get('value', '')
-            break
+#     query = ""
+#     conversations = example.get('conversations', [])
+#     for conv in conversations:
+#         if 'user' in str(conv.get('from', '')).lower():
+#             query = conv.get('value', '')
+#             break
     
-    sentences = sent_tokenize(full_text[:MAX_TEXT_LENGTH])
-    segments = []
+#     sentences = sent_tokenize(full_text[:MAX_TEXT_LENGTH])
+#     segments = []
     
-    for i, sent in enumerate(sentences):
-        if len(sent.strip()) < MIN_SENTENCE_LENGTH:
-            continue
+#     for i, sent in enumerate(sentences):
+#         if len(sent.strip()) < MIN_SENTENCE_LENGTH:
+#             continue
         
-        comp = estimate_compartment_advanced(sent)
-        hier = determine_hierarchy(sent, comp)  # ✅ Pass compartment
+#         comp = estimate_compartment_advanced(sent)
+#         hier = determine_hierarchy(sent, comp)  # ✅ Pass compartment
         
-        # ✅ Generate embedding HERE (before appending to segments)
-        try:
-            segment_embedding = sonar_encoder.encode(sent.strip())
-            if isinstance(segment_embedding, np.ndarray):
-                segment_embedding = segment_embedding.tolist()
-            elif hasattr(segment_embedding, 'tolist'):
-                segment_embedding = segment_embedding.tolist()
-            elif hasattr(segment_embedding, 'cpu'):  # PyTorch tensor
-                segment_embedding = segment_embedding.cpu().numpy().tolist()
-            elif hasattr(segment_embedding, 'numpy'):  # TF tensor
-                segment_embedding = segment_embedding.numpy().tolist()
-            else:
-                # Last resort: convert to numpy first
-                segment_embedding = np.array(segment_embedding).tolist()
+#         # ✅ Generate embedding HERE (before appending to segments)
+#         try:
+#             segment_embedding = sonar_encoder.encode(sent.strip())
+#             if isinstance(segment_embedding, np.ndarray):
+#                 segment_embedding = segment_embedding.tolist()
+#             elif hasattr(segment_embedding, 'tolist'):
+#                 segment_embedding = segment_embedding.tolist()
+#             elif hasattr(segment_embedding, 'cpu'):  # PyTorch tensor
+#                 segment_embedding = segment_embedding.cpu().numpy().tolist()
+#             elif hasattr(segment_embedding, 'numpy'):  # TF tensor
+#                 segment_embedding = segment_embedding.numpy().tolist()
+#             else:
+#                 # Last resort: convert to numpy first
+#                 segment_embedding = np.array(segment_embedding).tolist()
                 
-            if not isinstance(segment_embedding, list):
-                raise TypeError(f"Embedding is {type(segment_embedding)}, expected list")
+#             if not isinstance(segment_embedding, list):
+#                 raise TypeError(f"Embedding is {type(segment_embedding)}, expected list")
             
-        except Exception as e:
-            logger.warning(f"Doc {global_idx}, Seg {i}: Embedding failed - {e}")
-            logger.warning(f"Embedding logic failed! Pause pipeline and fix.")
-            continue  # Skip segment if embedding fails
+#         except Exception as e:
+#             logger.warning(f"Doc {global_idx}, Seg {i}: Embedding failed - {e}")
+#             logger.warning(f"Embedding logic failed! Pause pipeline and fix.")
+#             continue  # Skip segment if embedding fails
         
-        if len(segment_embedding) != 1024:
-            logger.error(f"Doc {global_idx}, Seg {i}: Embedding dimension is {len(segment_embedding)}, expected 1024")
-            logger.error("CRITICAL: SCM compliance violated! Pausing pipeline.")
-            raise ValueError(f"Embedding dimension mismatch: {len(segment_embedding)} vs 1024")
+#         if len(segment_embedding) != 1024:
+#             logger.error(f"Doc {global_idx}, Seg {i}: Embedding dimension is {len(segment_embedding)}, expected 1024")
+#             logger.error("CRITICAL: SCM compliance violated! Pausing pipeline.")
+#             raise ValueError(f"Embedding dimension mismatch: {len(segment_embedding)} vs 1024")
 
         
-        segments.append({
-            'text': sent.strip(),
-            'compartment': comp,
-            'hierarchy': hier,
-            'position': i,
-            'sonar_embedding': segment_embedding  # ✅ Store embedding
-        })
+#         segments.append({
+#             'text': sent.strip(),
+#             'compartment': comp,
+#             'hierarchy': hier,
+#             'position': i,
+#             'sonar_embedding': segment_embedding  # ✅ Store embedding
+#         })
     
-    if segments:
-        # Sample first doc in detail
-        if doc_count == 0:
-            logger.info(f"\n{'='*60}")
-            logger.info(f"SAMPLE DOCUMENT (Doc {global_idx})")
-            logger.info(f"{'='*60}")
-            logger.info(f"Query: {query[:200]}...")
-            logger.info(f"Text length: {len(full_text)} chars")
-            logger.info(f"Segments: {len(segments)}")
-            logger.info(f"Domain: {example.get('domain', 'N/A')}")
-            logger.info(f"\nFirst 3 segments:")
-            for seg in segments[:3]:
-                imp_score = compute_importance_score(seg['text'])
-                prec = get_precision_requirement(seg['compartment'], seg['hierarchy'])
-                logger.info(f"  [{seg['compartment']}] [{seg['hierarchy']}] [imp:{imp_score}] [prec:{prec}]")
-                logger.info(f"    Text: {seg['text'][:100]}...")
-            logger.info(f"{'='*60}\n")
+#     if segments:
+#         # Sample first doc in detail
+#         if doc_count == 0:
+#             logger.info(f"\n{'='*60}")
+#             logger.info(f"SAMPLE DOCUMENT (Doc {global_idx})")
+#             logger.info(f"{'='*60}")
+#             logger.info(f"Query: {query[:200]}...")
+#             logger.info(f"Text length: {len(full_text)} chars")
+#             logger.info(f"Segments: {len(segments)}")
+#             logger.info(f"Domain: {example.get('domain', 'N/A')}")
+#             logger.info(f"\nFirst 3 segments:")
+#             for seg in segments[:3]:
+#                 imp_score = compute_importance_score(seg['text'])
+#                 prec = get_precision_requirement(seg['compartment'], seg['hierarchy'])
+#                 logger.info(f"  [{seg['compartment']}] [{seg['hierarchy']}] [imp:{imp_score}] [prec:{prec}]")
+#                 logger.info(f"    Text: {seg['text'][:100]}...")
+#             logger.info(f"{'='*60}\n")
         
-        # FIX #12: Per-item DEBUG logging
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"--- DOC {global_idx} ---")
-            logger.debug(f"  Domain: {example.get('domain', 'N/A')}")
-            logger.debug(f"  Source: {example.get('source', 'N/A')}")
-            logger.debug(f"  Difficulty: {example.get('difficulty', 0)}")
-            logger.debug(f"  Segments: {len(segments)}")
-            logger.debug(f"  Query: {query[:100]}")
-            for i, seg in enumerate(segments[:5]):
-                logger.debug(f"    Seg {i}: [{seg['compartment']}] [{seg['hierarchy']}] {seg['text'][:50]}...")
+#         # FIX #12: Per-item DEBUG logging
+#         if logger.isEnabledFor(logging.DEBUG):
+#             logger.debug(f"--- DOC {global_idx} ---")
+#             logger.debug(f"  Domain: {example.get('domain', 'N/A')}")
+#             logger.debug(f"  Source: {example.get('source', 'N/A')}")
+#             logger.debug(f"  Difficulty: {example.get('difficulty', 0)}")
+#             logger.debug(f"  Segments: {len(segments)}")
+#             logger.debug(f"  Query: {query[:100]}")
+#             for i, seg in enumerate(segments[:5]):
+#                 logger.debug(f"    Seg {i}: [{seg['compartment']}] [{seg['hierarchy']}] {seg['text'][:50]}...")
         
-        doc_data[global_idx] = {
-            'segments': segments,
-            'query': query or full_text[:200],
-            'domain': example.get('domain', 'science'),
-            'source': example.get('source', 'OpenThoughts3'),
-            'difficulty': example.get('difficulty', 0)
-        }
+#         doc_data[global_idx] = {
+#             'segments': segments,
+#             'query': query or full_text[:200],
+#             'domain': example.get('domain', 'science'),
+#             'source': example.get('source', 'OpenThoughts3'),
+#             'difficulty': example.get('difficulty', 0)
+#         }
         
-        segments_added = 0
-        for seg in segments:
-            try:
-                # Generate clean embedding (1024-dim)
-                clean_embedding = seg['sonar_embedding']
+#         segments_added = 0
+#         for seg in segments:
+#             try:
+#                 # Generate clean embedding (1024-dim)
+#                 clean_embedding = seg['sonar_embedding']
                 
-                if not isinstance(clean_embedding, list):
-                    if hasattr(clean_embedding, 'tolist'):
-                        clean_embedding = clean_embedding.tolist()
-                    elif isinstance(clean_embedding, np.ndarray):
-                        clean_embedding = clean_embedding.tolist()
-                    else:
-                        raise TypeError(f"Invalid embedding type: {type(clean_embedding)}")
+#                 if not isinstance(clean_embedding, list):
+#                     if hasattr(clean_embedding, 'tolist'):
+#                         clean_embedding = clean_embedding.tolist()
+#                     elif isinstance(clean_embedding, np.ndarray):
+#                         clean_embedding = clean_embedding.tolist()
+#                     else:
+#                         raise TypeError(f"Invalid embedding type: {type(clean_embedding)}")
                 
-                # Apply diffusion noise
-                noisy_embedding, timestep, alpha_t = apply_diffusion_noise(clean_embedding)
+#                 # Apply diffusion noise
+#                 noisy_embedding, timestep, alpha_t = apply_diffusion_noise(clean_embedding)
                 
-            except Exception as e:
-                # FIX #10: Consistent error handling - skip on failure
-                logger.warning(f"Doc {global_idx}, Seg {seg['position']}: Embedding failed - {e}")
-                continue
+#             except Exception as e:
+#                 # FIX #10: Consistent error handling - skip on failure
+#                 logger.warning(f"Doc {global_idx}, Seg {seg['position']}: Embedding failed - {e}")
+#                 continue
             
-            tech_terms = extract_technical_terms(seg['text'])
-            importance = compute_importance_score(seg['text'])
-            precision = get_precision_requirement(seg['compartment'], seg['hierarchy'])
+#             tech_terms = extract_technical_terms(seg['text'])
+#             importance = compute_importance_score(seg['text'])
+#             precision = get_precision_requirement(seg['compartment'], seg['hierarchy'])
             
-            # FIX #7: Include query and difficulty
-            stage1_sample = {
-                "id": f"pretrain_{global_idx:06d}_{seg['position']}",
-                "text": seg['text'],
-                # "clean_embedding": clean_embedding,
-                "clean_embedding": seg['sonar_embedding'],  # ✅ Reuse from segment
-                "noisy_embedding": noisy_embedding,
-                "timestep": timestep,
-                "alpha_t": alpha_t,
-                "compartment": seg['compartment'],
-                "hierarchical_level": seg['hierarchy'].lower(),
-                "query": doc_data[global_idx]['query'],  # FIX #7
-                "metadata": {
-                    "domain": doc_data[global_idx]['domain'],
-                    "source": doc_data[global_idx]['source'],
-                    "difficulty": doc_data[global_idx]['difficulty'],  # FIX #7
-                    "technical_terms": tech_terms,
-                    "precision_required": precision,
-                    "importance_score": importance,
-                    "fragility_score": None
-                },
-                "diffusion_config": {
-                    "noise_schedule": "cosine",
-                    "sigma_min": DIFFUSION_SIGMA_MIN,
-                    "sigma_max": DIFFUSION_SIGMA_MAX,
-                    "t_max": DIFFUSION_T_MAX
-                }
-            }
+#             # FIX #7: Include query and difficulty
+#             stage1_sample = {
+#                 "id": f"pretrain_{global_idx:06d}_{seg['position']}",
+#                 "text": seg['text'],
+#                 # "clean_embedding": clean_embedding,
+#                 "clean_embedding": seg['sonar_embedding'],  # ✅ Reuse from segment
+#                 "noisy_embedding": noisy_embedding,
+#                 "timestep": timestep,
+#                 "alpha_t": alpha_t,
+#                 "compartment": seg['compartment'],
+#                 "hierarchical_level": seg['hierarchy'].lower(),
+#                 "query": doc_data[global_idx]['query'],  # FIX #7
+#                 "metadata": {
+#                     "domain": doc_data[global_idx]['domain'],
+#                     "source": doc_data[global_idx]['source'],
+#                     "difficulty": doc_data[global_idx]['difficulty'],  # FIX #7
+#                     "technical_terms": tech_terms,
+#                     "precision_required": precision,
+#                     "importance_score": importance,
+#                     "fragility_score": None
+#                 },
+#                 "diffusion_config": {
+#                     "noise_schedule": "cosine",
+#                     "sigma_min": DIFFUSION_SIGMA_MIN,
+#                     "sigma_max": DIFFUSION_SIGMA_MAX,
+#                     "t_max": DIFFUSION_T_MAX
+#                 }
+#             }
             
-            stage1_data.append(stage1_sample)
-            segments_added += 1
+#             stage1_data.append(stage1_sample)
+#             segments_added += 1
         
-        logger.debug(f"Doc {global_idx}: Added {segments_added}/{len(segments)} segments")
+#         logger.debug(f"Doc {global_idx}: Added {segments_added}/{len(segments)} segments")
         
-        doc_count += 1
-        docs_processed_this_run += 1
+#         doc_count += 1
+#         docs_processed_this_run += 1
         
-        if doc_count % STAGE1_CHECKPOINT_INTERVAL == 0:
-            logger.info(f"\n--- CHECKPOINT at {doc_count} docs ---")
-            logger.info(f"Total Stage 1 samples: {len(stage1_data)}")
-            logger.info(f"Memory usage: {len(stage1_data) * 1024 * 4 / (1024**2):.2f} MB")
+#         if doc_count % STAGE1_CHECKPOINT_INTERVAL == 0:
+#             logger.info(f"\n--- CHECKPOINT at {doc_count} docs ---")
+#             logger.info(f"Total Stage 1 samples: {len(stage1_data)}")
+#             logger.info(f"Memory usage: {len(stage1_data) * 1024 * 4 / (1024**2):.2f} MB")
             
-            # Lightweight checkpoint (metadata only for speed)
-            checkpoint_meta = {
-                'doc_data': doc_data,
-                'stage1_data': [],
-                'doc_count': doc_count,
-                'science_count': science_count,
-                'last_idx': global_idx,
-                'doc_ids_processed': list(doc_data.keys())
-            }
+#             # Lightweight checkpoint (metadata only for speed)
+#             checkpoint_meta = {
+#                 'doc_data': doc_data,
+#                 'stage1_data': [],
+#                 'doc_count': doc_count,
+#                 'science_count': science_count,
+#                 'last_idx': global_idx,
+#                 'doc_ids_processed': list(doc_data.keys())
+#             }
             
-            save_checkpoint(checkpoint_meta, "stage1_processing")
-            logger.info(f"Saved lightweight checkpoint")
+#             save_checkpoint(checkpoint_meta, "stage1_processing")
+#             logger.info(f"Saved lightweight checkpoint")
             
-            # FIX #1: Proper incremental append (only NEW samples)
-            stage1_file = os.path.join(OUTPUT_PATH, "stage1_pretrain.jsonl")
-            with open(stage1_file, 'a', encoding='utf-8') as f:
-                for item in stage1_data[last_written_stage1_idx:]:
-                    f.write(json.dumps(item, ensure_ascii=False) + '\n')
+#             # FIX #1: Proper incremental append (only NEW samples)
+#             stage1_file = os.path.join(OUTPUT_PATH, "stage1_pretrain.jsonl")
+#             with open(stage1_file, 'a', encoding='utf-8') as f:
+#                 for item in stage1_data[last_written_stage1_idx:]:
+#                     f.write(json.dumps(item, ensure_ascii=False) + '\n')
             
-            # FIX #1: Update tracker
-            written_count = len(stage1_data) - last_written_stage1_idx
-            logger.info(f"Appended {written_count} new samples to Stage 1 JSONL")
+#             # FIX #1: Update tracker
+#             written_count = len(stage1_data) - last_written_stage1_idx
+#             logger.info(f"Appended {written_count} new samples to Stage 1 JSONL")
             
-            stage1_data.clear() # Keep unwritten
-            last_written_stage1_idx = 0  # Reset tracker for next batch
-            gc.collect()
-            logger.info(f"Memory freed (retained {len(stage1_data)} unwritten samples)")
+#             stage1_data.clear() # Keep unwritten
+#             last_written_stage1_idx = 0  # Reset tracker for next batch
+#             gc.collect()
+#             logger.info(f"Memory freed (retained {len(stage1_data)} unwritten samples)")
             
-            logger.info("--- CHECKPOINT COMPLETE ---\n")
+#             logger.info("--- CHECKPOINT COMPLETE ---\n")
     
-    global_idx += 1
+#     global_idx += 1
 
-logger.info(f"\n{'='*80}")
-logger.info(f"STAGE 1 COMPLETE")
-logger.info(f"{'='*80}")
-logger.info(f"Total docs: {doc_count}")
-logger.info(f"Total samples: {len(stage1_data) + last_written_stage1_idx}")
-logger.info(f"Docs with segments: {len(doc_data)}")
+# logger.info(f"\n{'='*80}")
+# logger.info(f"STAGE 1 COMPLETE")
+# logger.info(f"{'='*80}")
+# logger.info(f"Total docs: {doc_count}")
+# logger.info(f"Total samples: {len(stage1_data) + last_written_stage1_idx}")
+# logger.info(f"Docs with segments: {len(doc_data)}")
 
-# FIX #3: Save full doc_data at end (with segments for Stage 2)
-save_checkpoint({
-    'doc_data': doc_data,  # Full data with segments
-    'stage1_data': [],
-    'doc_count': doc_count,
-    'science_count': science_count,
-    'last_idx': global_idx - 1,
-    'doc_ids_processed': list(doc_data.keys())
-}, "stage1_processing")
+# # FIX #3: Save full doc_data at end (with segments for Stage 2)
+# save_checkpoint({
+#     'doc_data': doc_data,  # Full data with segments
+#     'stage1_data': [],
+#     'doc_count': doc_count,
+#     'science_count': science_count,
+#     'last_idx': global_idx - 1,
+#     'doc_ids_processed': list(doc_data.keys())
+# }, "stage1_processing")
 
-# FIX #2: Correct final write logic (append remaining samples)
-stage1_file = os.path.join(OUTPUT_PATH, "stage1_pretrain.jsonl")
+# # FIX #2: Correct final write logic (append remaining samples)
+# stage1_file = os.path.join(OUTPUT_PATH, "stage1_pretrain.jsonl")
 
-if last_written_stage1_idx < len(stage1_data):
-    logger.info(f"Writing final {len(stage1_data) - last_written_stage1_idx} Stage 1 samples...")
-    with open(stage1_file, 'a', encoding='utf-8') as f:
-        for item in stage1_data[last_written_stage1_idx:]:
-            f.write(json.dumps(item, ensure_ascii=False) + '\n')
-    logger.info(f"✓ Final write complete")
-else:
-    logger.info(f"No remaining Stage 1 samples to write")
+# if last_written_stage1_idx < len(stage1_data):
+#     logger.info(f"Writing final {len(stage1_data) - last_written_stage1_idx} Stage 1 samples...")
+#     with open(stage1_file, 'a', encoding='utf-8') as f:
+#         for item in stage1_data[last_written_stage1_idx:]:
+#             f.write(json.dumps(item, ensure_ascii=False) + '\n')
+#     logger.info(f"✓ Final write complete")
+# else:
+#     logger.info(f"No remaining Stage 1 samples to write")
 
-# Count final samples
-if os.path.exists(stage1_file):
-    with open(stage1_file, 'r', encoding='utf-8') as f:
-        final_stage1_count = sum(1 for _ in f)
-    logger.info(f"Stage 1 JSONL total: {final_stage1_count} samples")
+# # Count final samples
+# if os.path.exists(stage1_file):
+#     with open(stage1_file, 'r', encoding='utf-8') as f:
+#         final_stage1_count = sum(1 for _ in f)
+#     logger.info(f"Stage 1 JSONL total: {final_stage1_count} samples")
 
-save_checkpoint({'doc_data': doc_data}, "doc_data_for_stage2")
+# save_checkpoint({'doc_data': doc_data}, "doc_data_for_stage2")
 
-del stage1_data
-gc.collect()
-logger.info("✓ Memory cleared")
+# del stage1_data
+# gc.collect()
+# logger.info("✓ Memory cleared")
 
 
 # ===================================================================
@@ -1092,245 +1093,247 @@ if stage2_checkpoint:
     else:
         logger.info(f"Resuming processing for {len(doc_data) - len(processed_doc_ids)} remaining docs...")
 
-else:
-    # No checkpoint - check if file exists (edge case: file exists but no checkpoint)
-    if os.path.exists(stage2_file):
-        with open(stage2_file, 'r', encoding='utf-8') as f:
-            existing_stage2_count = sum(1 for _ in f)
-        logger.warning(f"⚠ Stage 2 JSONL exists ({existing_stage2_count} samples) but no checkpoint found!")
-        logger.warning("This may indicate previous run crashed. Starting fresh...")
-        logger.warning("To resume, ensure stage2_progress.pkl checkpoint exists.")
+# else:
+#     # No checkpoint - check if file exists (edge case: file exists but no checkpoint)
+#     if os.path.exists(stage2_file):
+#         with open(stage2_file, 'r', encoding='utf-8') as f:
+#             existing_stage2_count = sum(1 for _ in f)
+#         logger.warning(f"⚠ Stage 2 JSONL exists ({existing_stage2_count} samples) but no checkpoint found!")
+#         logger.warning("This may indicate previous run crashed. Starting fresh...")
+#         logger.warning("To resume, ensure stage2_progress.pkl checkpoint exists.")
         
-        # User choice: Delete file or keep it
-        # Option 1: Keep file, append new results
-        logger.info("Keeping existing file and appending new results...")
-        stage2_data = []
-        processed_doc_ids = set()
-        processed_count = 0
+#         # User choice: Delete file or keep it
+#         # Option 1: Keep file, append new results
+#         logger.info("Keeping existing file and appending new results...")
+#         stage2_data = []
+#         processed_doc_ids = set()
+#         processed_count = 0
         
-        # Option 2 (commented out): Delete and restart
-        # os.remove(stage2_file)
-        # logger.info("Deleted existing file to start fresh")
-    else:
-        # Fresh start
-        stage2_data = []
-        processed_doc_ids = set()
-        processed_count = 0
-        logger.info("Starting fresh Stage 2...")
+#         # Option 2 (commented out): Delete and restart
+#         # os.remove(stage2_file)
+#         # logger.info("Deleted existing file to start fresh")
+#     else:
+#         # Fresh start
+#         stage2_data = []
+#         processed_doc_ids = set()
+#         processed_count = 0
+#         logger.info("Starting fresh Stage 2...")
 
-# ✅ Only proceed with processing if not already complete
-if len(processed_doc_ids) < len(doc_data):
-    # FIX #11: Validate doc_data exists
-    if not doc_data:
-        doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
-        if doc_data_checkpoint and 'doc_data' in doc_data_checkpoint:
-            doc_data = doc_data_checkpoint['doc_data']
-            logger.info(f"✓ Loaded doc_data: {len(doc_data)} documents")
-        else:
-            logger.error("✗ No doc_data. Run Stage 1 first.")
-            raise ValueError("Cannot proceed without doc_data")
+# # ✅ Only proceed with processing if not already complete
+# if len(processed_doc_ids) < len(doc_data):
+#     # FIX #11: Validate doc_data exists
+#     if not doc_data:
+#         doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
+#         if doc_data_checkpoint and 'doc_data' in doc_data_checkpoint:
+#             doc_data = doc_data_checkpoint['doc_data']
+#             logger.info(f"✓ Loaded doc_data: {len(doc_data)} documents")
+#         else:
+#             logger.error("✗ No doc_data. Run Stage 1 first.")
+#             raise ValueError("Cannot proceed without doc_data")
     
-    # FIX #11: Validate not empty
-    if len(doc_data) == 0:
-        logger.error("✗ Stage 2 requires doc_data from Stage 1")
-        logger.error("Please run Stage 1 first or check science filter settings")
-        raise ValueError("Cannot proceed with Stage 2: No documents available")
+#     # FIX #11: Validate not empty
+#     if len(doc_data) == 0:
+#         logger.error("✗ Stage 2 requires doc_data from Stage 1")
+#         logger.error("Please run Stage 1 first or check science filter settings")
+#         raise ValueError("Cannot proceed with Stage 2: No documents available")
     
-    logger.info(f"Processing {len(doc_data)} documents...")
-    logger.info(f"Already processed: {len(processed_doc_ids)}")
+#     logger.info(f"Processing {len(doc_data)} documents...")
+#     logger.info(f"Already processed: {len(processed_doc_ids)}")
     
-    last_written_idx = 0
-    embedding_failures_total = 0  # FIX #4: Track failures
+#     last_written_idx = 0
+#     embedding_failures_total = 0  # FIX #4: Track failures
     
-    # FIX #11: Validate doc_data exists
-    if not doc_data:
-        doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
-        if doc_data_checkpoint and 'doc_data' in doc_data_checkpoint:
-            doc_data = doc_data_checkpoint['doc_data']
-            logger.info(f"✓ Loaded doc_data: {len(doc_data)} documents")
-        else:
-            logger.error("✗ No doc_data. Run Stage 1 first.")
-            raise ValueError("Cannot proceed without doc_data")
+#     # FIX #11: Validate doc_data exists
+#     if not doc_data:
+#         doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
+#         if doc_data_checkpoint and 'doc_data' in doc_data_checkpoint:
+#             doc_data = doc_data_checkpoint['doc_data']
+#             logger.info(f"✓ Loaded doc_data: {len(doc_data)} documents")
+#         else:
+#             logger.error("✗ No doc_data. Run Stage 1 first.")
+#             raise ValueError("Cannot proceed without doc_data")
     
-    # FIX #11: Validate not empty
-    if len(doc_data) == 0:
-        logger.error("✗ Stage 2 requires doc_data from Stage 1")
-        logger.error("Please run Stage 1 first or check science filter settings")
-        raise ValueError("Cannot proceed with Stage 2: No documents available")
+#     # FIX #11: Validate not empty
+#     if len(doc_data) == 0:
+#         logger.error("✗ Stage 2 requires doc_data from Stage 1")
+#         logger.error("Please run Stage 1 first or check science filter settings")
+#         raise ValueError("Cannot proceed with Stage 2: No documents available")
     
-    logger.info(f"Processing {len(doc_data)} documents...")
-    logger.info(f"Already processed: {len(processed_doc_ids)}")
+#     logger.info(f"Processing {len(doc_data)} documents...")
+#     logger.info(f"Already processed: {len(processed_doc_ids)}")
     
-    last_written_idx = 0
-    embedding_failures_total = 0  # FIX #4: Track failures
+#     last_written_idx = 0
+#     embedding_failures_total = 0  # FIX #4: Track failures
     
-    for i, (doc_idx, data) in enumerate(tqdm(doc_data.items(), desc="Stage 2 Processing")):
-        if doc_idx in processed_doc_ids:
-            logger.debug(f"Doc {doc_idx}: Already processed")
-            processed_count += 1
-            continue
+#     for i, (doc_idx, data) in enumerate(tqdm(doc_data.items(), desc="Stage 2 Processing")):
+#         if doc_idx in processed_doc_ids:
+#             logger.debug(f"Doc {doc_idx}: Already processed")
+#             processed_count += 1
+#             continue
         
-        steps = []
-        embedding_failures_doc = 0
+#         steps = []
+#         embedding_failures_doc = 0
         
-        logger.info(f"Processing {len(data['segments'])} segments in parallel...")
+#         logger.info(f"Processing {len(data['segments'])} segments in parallel...")
 
-        # Process all segments in parallel
-        # segment_results = parallel_process_segments(data['segments'], sonar_encoder)
+#         # Process all segments in parallel
+#         # segment_results = parallel_process_segments(data['segments'], sonar_encoder)
 
-        # for seg, step_embedding in segment_results:
-        for seg in data['segments']:
-            step_num = seg['position'] + 1
+#         # for seg, step_embedding in segment_results:
+#         for seg in data['segments']:
+#             step_num = seg['position'] + 1
             
-            if 'sonar_embedding' not in seg:
-                logger.warning(f"Doc {doc_idx}, Step {step_num}: Missing embedding in segment")
-                embedding_failures_doc += 1
-                embedding_failures_total += 1
-                continue
+#             if 'sonar_embedding' not in seg:
+#                 logger.warning(f"Doc {doc_idx}, Step {step_num}: Missing embedding in segment")
+#                 embedding_failures_doc += 1
+#                 embedding_failures_total += 1
+#                 continue
             
-            step_embedding = seg['sonar_embedding']
+#             step_embedding = seg['sonar_embedding']
             
-            if step_embedding is None:
-                logger.warning(f"Doc {doc_idx}, Step {step_num}: Embedding failed")
-                embedding_failures_doc += 1
-                embedding_failures_total += 1
-                continue
+#             if step_embedding is None:
+#                 logger.warning(f"Doc {doc_idx}, Step {step_num}: Embedding failed")
+#                 embedding_failures_doc += 1
+#                 embedding_failures_total += 1
+#                 continue
             
-            if not isinstance(step_embedding, list):
-                logger.warning(f"Doc {doc_idx}, Step {step_num}: Embedding not a list")
-                embedding_failures_doc += 1
-                continue
+#             if not isinstance(step_embedding, list):
+#                 logger.warning(f"Doc {doc_idx}, Step {step_num}: Embedding not a list")
+#                 embedding_failures_doc += 1
+#                 continue
             
-            if len(step_embedding) != 1024:
-                logger.warning(f"Doc {doc_idx}, Step {step_num}: Embedding dimension {len(step_embedding)} != 1024")
-                embedding_failures_doc += 1
-                continue
+#             if len(step_embedding) != 1024:
+#                 logger.warning(f"Doc {doc_idx}, Step {step_num}: Embedding dimension {len(step_embedding)} != 1024")
+#                 embedding_failures_doc += 1
+#                 continue
                     
-            importance = compute_importance_score(seg['text'])
-            precision = get_precision_requirement(seg['compartment'], seg['hierarchy'])
+#             importance = compute_importance_score(seg['text'])
+#             precision = get_precision_requirement(seg['compartment'], seg['hierarchy'])
             
-            steps.append({
-                "step": step_num,
-                "compartment": seg['compartment'],
-                "hierarchy": seg['hierarchy'],
-                "text": seg['text'],
-                "sonar_embedding": step_embedding,
-                "precision": precision,
-                "importance_score": importance
-            })
+#             steps.append({
+#                 "step": step_num,
+#                 "compartment": seg['compartment'],
+#                 "hierarchy": seg['hierarchy'],
+#                 "text": seg['text'],
+#                 "sonar_embedding": step_embedding,
+#                 "precision": precision,
+#                 "importance_score": importance
+#             })
         
-        # FIX #4: Log embedding failures per doc
-        if embedding_failures_doc > 0:
-            logger.warning(f"Doc {doc_idx}: {embedding_failures_doc}/{len(data['segments'])} embeddings failed")
+#         # FIX #4: Log embedding failures per doc
+#         if embedding_failures_doc > 0:
+#             logger.warning(f"Doc {doc_idx}: {embedding_failures_doc}/{len(data['segments'])} embeddings failed")
         
-        if len(steps) >= 1:
-            steps.sort(key=lambda x: x['step'])
-            final_answer = '. '.join(step['text'] for step in steps) + '.'
+#         if len(steps) >= 1:
+#             steps.sort(key=lambda x: x['step'])
+#             final_answer = '. '.join(step['text'] for step in steps) + '.'
             
-            comp_dist = {}
-            hier_dist = {}
-            for step in steps:
-                comp_dist[step['compartment']] = comp_dist.get(step['compartment'], 0) + 1
-                hier_dist[step['hierarchy']] = hier_dist.get(step['hierarchy'], 0) + 1
+#             comp_dist = {}
+#             hier_dist = {}
+#             for step in steps:
+#                 comp_dist[step['compartment']] = comp_dist.get(step['compartment'], 0) + 1
+#                 hier_dist[step['hierarchy']] = hier_dist.get(step['hierarchy'], 0) + 1
             
-            stage2_sample = {
-                "id": f"sft_{doc_idx:06d}",
-                "domain": data['domain'],
-                "query": data['query'],
-                "reasoning_chain": steps,
-                "final_answer": final_answer,
-                "metadata": {
-                    "num_steps": len(steps),
-                    "compartment_distribution": comp_dist,
-                    "hierarchy_distribution": hier_dist,
-                    "avg_importance": round(sum(s['importance_score'] for s in steps) / len(steps), 2),
-                    "code_validated": False,
-                    "quality_score": 0.85
-                }
-            }
+#             stage2_sample = {
+#                 "id": f"sft_{doc_idx:06d}",
+#                 "domain": data['domain'],
+#                 "query": data['query'],
+#                 "reasoning_chain": steps,
+#                 "final_answer": final_answer,
+#                 "metadata": {
+#                     "num_steps": len(steps),
+#                     "compartment_distribution": comp_dist,
+#                     "hierarchy_distribution": hier_dist,
+#                     "avg_importance": round(sum(s['importance_score'] for s in steps) / len(steps), 2),
+#                     "code_validated": False,
+#                     "quality_score": 0.85
+#                 }
+#             }
             
-            stage2_data.append(stage2_sample)
-            processed_doc_ids.add(doc_idx)
+#             stage2_data.append(stage2_sample)
+#             processed_doc_ids.add(doc_idx)
             
-            # Sample first output
-            if len(stage2_data) == 1:
-                logger.info(f"\n{'='*60}")
-                logger.info(f"SAMPLE STAGE 2 OUTPUT (SCM COMPLIANT)")
-                logger.info(f"{'='*60}")
-                logger.info(f"ID: {stage2_sample['id']}")
-                logger.info(f"Query: {stage2_sample['query'][:200]}...")
-                logger.info(f"Steps: {len(steps)}")
-                logger.info(f"Compartment dist: {comp_dist}")
-                logger.info(f"Hierarchy dist: {hier_dist}")
-                logger.info(f"Avg importance: {stage2_sample['metadata']['avg_importance']}")
-                logger.info(f"\nFirst 2 steps (with embeddings):")
-                for step in steps[:2]:
-                    logger.info(f"  Step {step['step']} [{step['compartment']}] [{step['hierarchy']}]")
-                    logger.info(f"    Importance: {step['importance_score']}, Precision: {step['precision']}, Embedding: ✓")
-                    logger.info(f"    Text: {step['text'][:100]}...")
-                logger.info(f"{'='*60}\n")
+#             # Sample first output
+#             if len(stage2_data) == 1:
+#                 logger.info(f"\n{'='*60}")
+#                 logger.info(f"SAMPLE STAGE 2 OUTPUT (SCM COMPLIANT)")
+#                 logger.info(f"{'='*60}")
+#                 logger.info(f"ID: {stage2_sample['id']}")
+#                 logger.info(f"Query: {stage2_sample['query'][:200]}...")
+#                 logger.info(f"Steps: {len(steps)}")
+#                 logger.info(f"Compartment dist: {comp_dist}")
+#                 logger.info(f"Hierarchy dist: {hier_dist}")
+#                 logger.info(f"Avg importance: {stage2_sample['metadata']['avg_importance']}")
+#                 logger.info(f"\nFirst 2 steps (with embeddings):")
+#                 for step in steps[:2]:
+#                     logger.info(f"  Step {step['step']} [{step['compartment']}] [{step['hierarchy']}]")
+#                     logger.info(f"    Importance: {step['importance_score']}, Precision: {step['precision']}, Embedding: ✓")
+#                     logger.info(f"    Text: {step['text'][:100]}...")
+#                 logger.info(f"{'='*60}\n")
             
-            # FIX #12: Per-item DEBUG logging
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"--- STAGE 2 DOC {doc_idx} ---")
-                logger.debug(f"  Steps: {len(steps)}")
-                logger.debug(f"  Comp dist: {comp_dist}")
-                logger.debug(f"  Hier dist: {hier_dist}")
-                logger.debug(f"  Avg importance: {stage2_sample['metadata']['avg_importance']}")
+#             # FIX #12: Per-item DEBUG logging
+#             if logger.isEnabledFor(logging.DEBUG):
+#                 logger.debug(f"--- STAGE 2 DOC {doc_idx} ---")
+#                 logger.debug(f"  Steps: {len(steps)}")
+#                 logger.debug(f"  Comp dist: {comp_dist}")
+#                 logger.debug(f"  Hier dist: {hier_dist}")
+#                 logger.debug(f"  Avg importance: {stage2_sample['metadata']['avg_importance']}")
             
-            logger.debug(f"Doc {doc_idx}: Created Stage 2 sample with {len(steps)} steps")
-        else:
-            logger.warning(f"Doc {doc_idx}: No valid steps")
+#             logger.debug(f"Doc {doc_idx}: Created Stage 2 sample with {len(steps)} steps")
+#         else:
+#             logger.warning(f"Doc {doc_idx}: No valid steps")
         
-        processed_count += 1
+#         processed_count += 1
         
-        if processed_count % STAGE2_CHECKPOINT_INTERVAL == 0:
-            logger.info(f"\n--- STAGE 2 CHECKPOINT at {processed_count} docs ---")
-            logger.info(f"Total samples: {len(stage2_data)}")
+#         if processed_count % STAGE2_CHECKPOINT_INTERVAL == 0:
+#             logger.info(f"\n--- STAGE 2 CHECKPOINT at {processed_count} docs ---")
+#             logger.info(f"Total samples: {len(stage2_data)}")
             
-            with open(stage2_file, 'a', encoding='utf-8') as f:
-                for item in stage2_data[last_written_idx:]:
-                    f.write(json.dumps(item, ensure_ascii=False) + '\n')
+#             with open(stage2_file, 'a', encoding='utf-8') as f:
+#                 for item in stage2_data[last_written_idx:]:
+#                     f.write(json.dumps(item, ensure_ascii=False) + '\n')
             
-            last_written_idx = len(stage2_data)
-            logger.info(f"✓ Appended to JSONL")
+#             last_written_idx = len(stage2_data)
+#             logger.info(f"✓ Appended to JSONL")
             
-            save_checkpoint({
-                'stage2_data': stage2_data,
-                'processed_doc_ids': list(processed_doc_ids)
-            }, "stage2_progress")
+#             save_checkpoint({
+#                 'stage2_data': stage2_data,
+#                 'processed_doc_ids': list(processed_doc_ids)
+#             }, "stage2_progress")
             
-            gc.collect()
-            logger.info("--- CHECKPOINT COMPLETE ---\n")
+#             gc.collect()
+#             logger.info("--- CHECKPOINT COMPLETE ---\n")
     
-    if last_written_idx < len(stage2_data):
-        logger.info(f"Writing final samples...")
-        with open(stage2_file, 'a', encoding='utf-8') as f:
-            for item in stage2_data[last_written_idx:]:
-                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+#     if last_written_idx < len(stage2_data):
+#         logger.info(f"Writing final samples...")
+#         with open(stage2_file, 'a', encoding='utf-8') as f:
+#             for item in stage2_data[last_written_idx:]:
+#                 f.write(json.dumps(item, ensure_ascii=False) + '\n')
     
-    logger.info(f"\n{'='*80}")
-    logger.info(f"STAGE 2 COMPLETE")
-    logger.info(f"{'='*80}")
-    logger.info(f"Total samples: {len(stage2_data)}")
-    logger.info(f"Multi-step CoT: {sum(1 for d in stage2_data if d['metadata']['num_steps'] >= 2)}")
-    logger.info(f"Total embedding failures: {embedding_failures_total}")  # FIX #4
+#     logger.info(f"\n{'='*80}")
+#     logger.info(f"STAGE 2 COMPLETE")
+#     logger.info(f"{'='*80}")
+#     logger.info(f"Total samples: {len(stage2_data)}")
+#     logger.info(f"Multi-step CoT: {sum(1 for d in stage2_data if d['metadata']['num_steps'] >= 2)}")
+#     logger.info(f"Total embedding failures: {embedding_failures_total}")  # FIX #4
     
-    save_checkpoint({
-        'stage2_data': stage2_data,
-        'processed_doc_ids': list(processed_doc_ids)
-    }, "stage2_progress")
+#     save_checkpoint({
+#         'stage2_data': stage2_data,
+#         'processed_doc_ids': list(processed_doc_ids)
+#     }, "stage2_progress")
 
 logger.info("="*80)
 logger.info("STAGE 3: RLAIF (PREFERENCE LEARNING)")
-logger.info("SCM Compliance: Structured candidate parsing + validation")
+logger.info("SCM Compliance: JSON-based structured output + validation")
 logger.info("="*80)
 
+
 logger.info("Checking Ollama availability...")
-OLLAMA_MODEL = 'deepseek-r1:1.5b'
+OLLAMA_MODEL = 'llama3.2:3b'
+
 
 try:
-    test_response = requests.get('http://localhost:11434/api/tags', timeout=5)
+    test_response = requests.get('http://localhost:11434/api/tags', timeout=30)
     if test_response.status_code == 200:
         models = test_response.json().get('models', [])
         model_names = [m.get('name', '') for m in models]
@@ -1345,249 +1348,391 @@ except Exception as e:
     logger.error(f"✗ Ollama not accessible: {e}")
     logger.error("Stage 3 cannot proceed without Ollama")
 
-def parse_compartment_cot(raw_text):
-    """
-    Parse LLM output with multi-level fallback for malformed formats.
+
+# Globals (define these in your main code if not already)
+VALID_COMPARTMENTS = ['FACTUAL', 'PROCEDURAL', 'EPISODIC', 'CONTEXTUAL', 'CONCEPTUAL']
+VALID_HIERARCHIES = ['GRANULAR', 'INTERMEDIATE', 'GENERAL']
+
+# Assume these functions exist: sonar_encoder.encode(), compute_importance_score(text), get_precision_requirement(comp, hier)
+# logger = your logging setup
+
+class JSONRepairStages:
+    """Encapsulates multi-stage JSON repair for modularity."""
     
-    Handles:
-    1. Strict: Step X [COMPARTMENT] [HIERARCHY]: text
-    2. Fallback 1: Step X [COMPARTMENT]: text (missing hierarchy)
-    3. Fallback 2: Step X [ COMPARTMENT ]: text (extra spaces)
-    4. Fallback 3: Step X [COMPARTMENT] text (missing colon)
-    5. Fallback 4: Step X (COMPARTMENT): text (parentheses)
-    """
-    steps = []
-    
-    # ========== ATTEMPT 1: Strict Format (brackets + hierarchy + colon) ==========
-    pattern_strict = r'Step\s+(\d+)\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s*:\s*(.+?)(?=Step\s+\d+|\Z)'
-    
-    for match in re.finditer(pattern_strict, raw_text, re.DOTALL | re.IGNORECASE):
-        step_text = match.group(4).strip()
-        comp = match.group(2).strip().upper()
-        hier = match.group(3).strip().upper()
-        
-        # Validate and default if invalid
-        if comp not in VALID_COMPARTMENTS:
-            logger.warning(f"Invalid compartment '{comp}', defaulting to CONCEPTUAL")
-            comp = 'CONCEPTUAL'
-        
-        if hier not in VALID_HIERARCHIES:
-            logger.warning(f"Invalid hierarchy '{hier}', defaulting to GENERAL")
-            hier = 'GENERAL'
-        
-        # Generate embedding
+    @staticmethod
+    def stage1_direct_parse(text: str) -> Optional[Dict[str, Any]]:
+        """Stage 1: Direct JSON parse (fast path)."""
         try:
-            step_embedding = sonar_encoder.encode(step_text)
-            if hasattr(step_embedding, 'tolist'):
-                step_embedding = step_embedding.tolist()
-            elif isinstance(step_embedding, np.ndarray):
-                step_embedding = step_embedding.tolist()
-        except:
-            step_embedding = None
-        
-        steps.append({
-            'step': int(match.group(1)),
-            'compartment': comp,
-            'hierarchy': hier,
-            'text': step_text,
-            'sonar_embedding': step_embedding,
-            'importance_score': compute_importance_score(step_text),
-            'precision': get_precision_requirement(comp, hier)
-        })
+            data = json.loads(text)
+            if isinstance(data, dict) and 'segments' in data:
+                return data
+            return None
+        except json.JSONDecodeError:
+            return None
     
-    # ========== ATTEMPT 2: Missing Hierarchy (but has colon) ==========
-    if len(steps) == 0:
-        logger.warning("Strict parsing failed, trying fallback 1 (missing hierarchy)...")
-        pattern_fallback1 = r'Step\s+(\d+)\s+\[([^\]]+)\]\s*:\s*(.+?)(?=Step\s+\d+|\Z)'
+    @staticmethod
+    def stage2_quote_keys(text: str) -> str:
+        """Stage 2: Add quotes to unquoted keys (e.g., {key: value} -> {"key": value})."""
+        # Pattern for unquoted keys: identifier followed by : (not in string)
+        def quote_match(match):
+            key = match.group(1).strip()
+            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', key):  # Valid JS identifier
+                return f'"{key}":'
+            return match.group(0)
         
-        for match in re.finditer(pattern_fallback1, raw_text, re.DOTALL | re.IGNORECASE):
-            step_text = match.group(3).strip()
-            comp = match.group(2).strip().upper()
-            hier = 'GENERAL'  # Default hierarchy
-            
-            if comp not in VALID_COMPARTMENTS:
-                logger.warning(f"Invalid compartment '{comp}', defaulting to CONCEPTUAL")
-                comp = 'CONCEPTUAL'
-            
+        repaired = re.sub(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(?![{["\s])', quote_match, text)
+        if repaired != text:
+            logger.debug("Stage 2: Quoted unquoted keys")
+        return repaired
+    
+    @staticmethod
+    def stage3_fix_commas_braces(text: str) -> str:
+        """Stage 3: Remove trailing/extra commas, balance braces/brackets."""
+        # Remove trailing commas before } or ]
+        text = re.sub(r',(\s*[}\]])', r'\1', text)
+        # Remove extra commas in objects/arrays
+        text = re.sub(r'\{\s*,', '{', text)
+        text = re.sub(r'\[\s*,', '[', text)
+        # Balance braces (simple heuristic: add missing })
+        brace_count = text.count('{') - text.count('}')
+        bracket_count = text.count('[') - text.count(']')
+        text += '}' * max(0, brace_count)
+        text += ']' * max(0, bracket_count)
+        if brace_count > 0 or bracket_count > 0:
+            logger.debug(f"Stage 3: Balanced {brace_count} braces, {bracket_count} brackets")
+        return text
+    
+    @staticmethod
+    def stage4_partial_object(text: str) -> str:
+        """Stage 4: Handle partials like "segments": [...] or [ ... ] -> full {"segments": [...]}."""
+        # If starts with "segments":
+        if re.match(r'^\s*"segments"\s*:\s*\[', text):
+            pass  # Already good, but ensure outer {}
+        elif re.match(r'^\s*segments\s*:\s*\[', text):
+            text = re.sub(r'^segments\s*:\s*', '"segments": ', text)
+            if not text.startswith('{'):
+                text = '{' + text + '}'
+        # If starts with array, wrap as segments
+        elif re.match(r'^\s*\[', text):
+            text = '{"segments": ' + text + ', "final_answer": ""}'
+        # Handle "output": { ... } or similar wrappers
+        text = re.sub(r'^\s*"output"\s*:\s*(\{.*\})', r'\1', text, flags=re.DOTALL)
+        text = re.sub(r'^\s*output\s*:\s*(\{.*\})', r'\1', text, flags=re.DOTALL | re.IGNORECASE)
+        return text
+    
+    @staticmethod
+    def stage5_extract_segments(text: str) -> Optional[Dict[str, Any]]:
+        """Stage 5: Last resort - regex extract segments array and reconstruct."""
+        seg_match = re.search(r'"segments"\s*:\s*\[([^\]]*)\]', text, re.DOTALL)
+        if not seg_match:
+            # Broader match for unquoted
+            seg_match = re.search(r'segments\s*:\s*\[([^\]]*)\]', text, re.DOTALL | re.IGNORECASE)
+        if seg_match:
+            segments_str = seg_match.group(1)
+            # Parse individual segments
             try:
-                step_embedding = sonar_encoder.encode(step_text)
-                if hasattr(step_embedding, 'tolist'):
-                    step_embedding = step_embedding.tolist()
-                elif isinstance(step_embedding, np.ndarray):
-                    step_embedding = step_embedding.tolist()
+                # Simple wrap and parse
+                seg_json = f'{{"segments": [{segments_str}]}}'
+                data = json.loads(seg_json)
+                data['final_answer'] = ''  # Default
+                logger.warning("Stage 5: Reconstructed from segments array only")
+                return data
             except:
-                step_embedding = None
-            
-            steps.append({
-                'step': int(match.group(1)),
-                'compartment': comp,
-                'hierarchy': hier,
-                'text': step_text,
-                'sonar_embedding': step_embedding,
-                'importance_score': compute_importance_score(step_text),
-                'precision': get_precision_requirement(comp, hier)
-            })
-            
-            logger.warning(f"Step {match.group(1)}: No hierarchy found, defaulting to GENERAL")
+                pass
+        return None
     
-    # ========== ATTEMPT 3: Missing Colon (but has brackets) ==========
-    if len(steps) == 0:
-        logger.warning("Fallback 1 failed, trying fallback 2 (missing colon)...")
-        pattern_fallback2 = r'Step\s+(\d+)\s+\[([^\]]+)\]\s+(.+?)(?=Step\s+\d+|\Z)'
+    @staticmethod
+    def stage6_per_segment_regex(text: str) -> List[Dict[str, Any]]:
+        """Stage 6: Nuclear option - regex each segment individually (no full JSON)."""
+        # Pattern for individual segments: {"seg_id": N, "compartment": "...", "hierarchy": "...", "text": "..."}
+        seg_pattern = r'\{[^}]*"seg_id"\s*:\s*(?:\d+)[^}]*"compartment"\s*:\s*"([^"]*)"[^{}]*"hierarchy"\s*:\s*"([^"]*)"[^{}]*"text"\s*:\s*"([^"]*)"[^{}]*\}'
+        matches = re.findall(seg_pattern, text, re.DOTALL | re.IGNORECASE)
+        steps = []
+        for comp, hier, txt in matches:
+            try:
+                comp = comp.strip().upper()
+                hier = hier.strip().upper()
+                txt = txt.strip()
+                if len(txt) < 10:
+                    continue
+                if comp not in VALID_COMPARTMENTS:
+                    comp = 'CONCEPTUAL'
+                if hier not in VALID_HIERARCHIES:
+                    hier = 'GENERAL'
+                # Mock embedding (replace with real)
+                embedding = None  # sonar_encoder.encode(txt).tolist()
+                steps.append({
+                    'Seg': len(steps),  # Approximate ID
+                    'compartment': comp,
+                    'hierarchy': hier,
+                    'text': txt,
+                    'sonar_embedding': embedding,
+                    'importance_score': 0.5,  # Default; use compute_importance_score(txt)
+                    'precision': 1.0  # Default; use get_precision_requirement(comp, hier)
+                })
+            except:
+                continue
+        if steps:
+            logger.warning(f"Stage 6: Recovered {len(steps)} segments via regex")
+        return steps
+
+def robust_json_extractor(raw_response: str) -> str:
+    """
+    Extraction with PRIORITY ORDERING: Check valid JSON first, then clean.
+    """
+    if not raw_response or not raw_response.strip():
+        return ""
+    
+    raw_response = raw_response.strip()
+    
+    # ========== PRIORITY 1: Already valid JSON (most common case) ==========
+    if raw_response.startswith('{'):
+        logger.debug("Found JSON at start (no extraction needed)")
+        return raw_response
+    
+    # ========== PRIORITY 2: Markdown code block ==========
+    markdown_match = re.search(r'``````', raw_response, re.DOTALL)
+    if markdown_match:
+        logger.debug("Extracted JSON from markdown block")
+        return markdown_match.group(1).strip()
+    
+    # ========== PRIORITY 3: Common prefixes (e.g., "Here is:") ==========
+    # Remove EXACTLY these phrases (case-insensitive, anchored to start)
+    prefix_cleaners = [
+        (r'^\s*Here\s+is\s+the\s+(?:generated\s+)?JSON\s+(?:response\s*)?:?\s*', ''),
+        (r'^\s*(?:JSON|Output|Response|Generated|Result)\s*:?\s*', ''),
+        (r'^\s*The\s+(?:JSON\s+)?(?:response\s+)?is\s*:?\s*', ''),
+    ]
+    
+    for pattern, replacement in prefix_cleaners:
+        cleaned = re.sub(pattern, replacement, raw_response, count=1, flags=re.IGNORECASE)
+        if cleaned != raw_response and cleaned.strip().startswith('{'):
+            logger.debug(f"Removed prefix: {pattern}")
+            return cleaned.strip()
+    
+    # ========== PRIORITY 4: Find first { ... } balanced block ==========
+    brace_start = raw_response.find('{')
+    if brace_start == -1:
+        logger.warning("No opening brace found in response")
+        return ""
+    
+    # Find matching closing brace
+    brace_count = 0
+    brace_end = -1
+    for i in range(brace_start, len(raw_response)):
+        if raw_response[i] == '{':
+            brace_count += 1
+        elif raw_response[i] == '}':
+            brace_count -= 1
+            if brace_count == 0:
+                brace_end = i
+                break
+    
+    if brace_end != -1:
+        extracted = raw_response[brace_start:brace_end + 1]
+        logger.debug(f"Extracted balanced JSON from position {brace_start}-{brace_end}")
+        return extracted
+    
+    # ========== PRIORITY 5: Partial JSON (unbalanced) ==========
+    # Try to balance braces automatically
+    partial = raw_response[brace_start:]
+    open_braces = partial.count('{')
+    close_braces = partial.count('}')
+    
+    if open_braces > close_braces:
+        missing = open_braces - close_braces
+        partial += '}' * missing
+        logger.warning(f"Added {missing} closing braces to balance JSON")
+        return partial
+    
+    logger.error(f"Could not extract JSON from: {raw_response[:200]}...")
+    return ""
+
+
+def parse_json_segments(json_response: str, min_segments: int = 10) -> List[Dict[str, Any]]:
+    """Enhanced with better error recovery."""
+    steps = []
+    extracted = robust_json_extractor(json_response)
+    
+    if not extracted:
+        logger.error(f"Extractor failed on: {json_response[:300]}...")
+        return steps
+    
+    logger.debug(f"Parsing: {extracted[:200]}...")
+    
+    # Try direct parse first (99% of cases after good extraction)
+    parsed_data = JSONRepairStages.stage1_direct_parse(extracted)
+    
+    if parsed_data is None:
+        # Apply repairs progressively
+        current_text = extracted
         
-        for match in re.finditer(pattern_fallback2, raw_text, re.DOTALL | re.IGNORECASE):
-            step_text = match.group(3).strip()
-            comp = match.group(2).strip().upper()
-            hier = 'GENERAL'
-            
-            # Check if text starts with another bracket (hierarchy present but no colon)
-            hier_match = re.match(r'\[([^\]]+)\]\s*(.+)', step_text, re.DOTALL)
-            if hier_match:
-                hier = hier_match.group(1).strip().upper()
-                step_text = hier_match.group(2).strip()
+        # Stage 2: Quote unquoted keys
+        current_text = JSONRepairStages.stage2_quote_keys(current_text)
+        parsed_data = JSONRepairStages.stage1_direct_parse(current_text)
+        
+        if parsed_data is None:
+            # Stage 3: Fix commas/braces
+            current_text = JSONRepairStages.stage3_fix_commas_braces(current_text)
+            parsed_data = JSONRepairStages.stage1_direct_parse(current_text)
+        
+        if parsed_data is None:
+            # Stage 4: Handle partials
+            current_text = JSONRepairStages.stage4_partial_object(current_text)
+            parsed_data = JSONRepairStages.stage1_direct_parse(current_text)
+        
+        if parsed_data is None:
+            # Stage 5: Regex extraction
+            parsed_data = JSONRepairStages.stage5_extract_segments(current_text)
+    
+    if parsed_data is None or 'segments' not in parsed_data:
+        # Last resort: Per-segment regex
+        steps = JSONRepairStages.stage6_per_segment_regex(json_response)
+        logger.warning(f"Used regex fallback: {len(steps)} segments")
+        return steps
+    
+    # Process segments (same as before)
+    segments = parsed_data.get('segments', [])
+    for i, segment in enumerate(segments):
+        try:
+            seg_id = int(segment.get('seg_id', i))
+            comp = segment.get('compartment', 'CONCEPTUAL').strip().upper()
+            hier = segment.get('hierarchy', 'GENERAL').strip().upper()
+            text = segment.get('text', '').strip()
             
             if comp not in VALID_COMPARTMENTS:
                 comp = 'CONCEPTUAL'
             if hier not in VALID_HIERARCHIES:
                 hier = 'GENERAL'
+            if len(text) < 10:
+                continue
             
             try:
-                step_embedding = sonar_encoder.encode(step_text)
-                if hasattr(step_embedding, 'tolist'):
-                    step_embedding = step_embedding.tolist()
-                elif isinstance(step_embedding, np.ndarray):
-                    step_embedding = step_embedding.tolist()
-            except:
-                step_embedding = None
+                embedding = sonar_encoder.encode(text)
+                if hasattr(embedding, 'tolist'):
+                    embedding = embedding.tolist()
+                elif isinstance(embedding, np.ndarray):
+                    embedding = embedding.tolist()
+            except Exception as e:
+                logger.debug(f"Embedding failed (seg {seg_id}): {e}")
+                embedding = None
             
             steps.append({
-                'step': int(match.group(1)),
+                'Seg': seg_id,
                 'compartment': comp,
                 'hierarchy': hier,
-                'text': step_text,
-                'sonar_embedding': step_embedding,
-                'importance_score': compute_importance_score(step_text),
+                'text': text,
+                'sonar_embedding': embedding,
+                'importance_score': compute_importance_score(text),
                 'precision': get_precision_requirement(comp, hier)
             })
+        except Exception as e:
+            logger.debug(f"Skipped segment {i}: {e}")
+            continue
     
-    # ========== ATTEMPT 4: Parentheses Format (fallback to old parser) ==========
-    if len(steps) == 0:
-        logger.warning("Fallback 2 failed, trying fallback 3 (parentheses format)...")
-        pattern_fallback3 = r'Step\s+(\d+)\s+\(([^\)]+)\)\s*:\s*(.+?)(?=Step\s+\d+|\Z)'
-        
-        for match in re.finditer(pattern_fallback3, raw_text, re.DOTALL | re.IGNORECASE):
-            step_text = match.group(3).strip()
-            comp = match.group(2).strip().upper()
-            hier = 'GENERAL'
-            
-            if comp not in VALID_COMPARTMENTS:
-                comp = 'CONCEPTUAL'
-            
-            try:
-                step_embedding = sonar_encoder.encode(step_text)
-                if hasattr(step_embedding, 'tolist'):
-                    step_embedding = step_embedding.tolist()
-                elif isinstance(step_embedding, np.ndarray):
-                    step_embedding = step_embedding.tolist()
-            except:
-                step_embedding = None
-            
-            steps.append({
-                'step': int(match.group(1)),
-                'compartment': comp,
-                'hierarchy': hier,
-                'text': step_text,
-                'sonar_embedding': step_embedding,
-                'importance_score': compute_importance_score(step_text),
-                'precision': get_precision_requirement(comp, hier)
-            })
-    
-    # ========== ATTEMPT 5: Ultra-Loose (just "Step X" + text) ==========
-    if len(steps) == 0:
-        logger.warning("All structured formats failed, trying ultra-loose parser...")
-        pattern_fallback4 = r'Step\s+(\d+)[^\n]*\n(.+?)(?=Step\s+\d+|\Z)'
-        
-        for match in re.finditer(pattern_fallback4, raw_text, re.DOTALL | re.IGNORECASE):
-            step_text = match.group(2).strip()
-            
-            # Default compartment/hierarchy
-            comp = 'CONCEPTUAL'
-            hier = 'GENERAL'
-            
-            # Try to extract compartment from text if present
-            comp_match = re.search(r'\[?(FACTUAL|PROCEDURAL|EPISODIC|CONTEXTUAL|CONCEPTUAL)\]?', step_text, re.IGNORECASE)
-            if comp_match:
-                comp = comp_match.group(1).upper()
-                # Remove the matched compartment from text
-                step_text = re.sub(r'\[?(FACTUAL|PROCEDURAL|EPISODIC|CONTEXTUAL|CONCEPTUAL)\]?\s*:?\s*', '', step_text, count=1, flags=re.IGNORECASE)
-            
-            try:
-                step_embedding = sonar_encoder.encode(step_text)
-                if hasattr(step_embedding, 'tolist'):
-                    step_embedding = step_embedding.tolist()
-                elif isinstance(step_embedding, np.ndarray):
-                    step_embedding = step_embedding.tolist()
-            except:
-                step_embedding = None
-            
-            steps.append({
-                'step': int(match.group(1)),
-                'compartment': comp,
-                'hierarchy': hier,
-                'text': step_text,
-                'sonar_embedding': step_embedding,
-                'importance_score': compute_importance_score(step_text),
-                'precision': get_precision_requirement(comp, hier)
-            })
-            
-            logger.warning(f"Step {match.group(1)}: Used ultra-loose parser (defaults: {comp}, {hier})")
-    
-    # Final validation
-    if len(steps) == 0:
-        logger.error("All parsing attempts failed - no valid steps extracted")
-    else:
-        logger.info(f"✓ Parsed {len(steps)} steps (using appropriate fallback level)")
-    
+    logger.info(f"Parsed {len(steps)} segments (min: {min_segments})")
     return steps
 
-def extract_final_answer(raw_text):
-    """Extract final answer from LLM output."""
-    match = re.search(r'Final Answer:\s*(.+?)(?:\n|$)', raw_text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
+def extract_final_answer_from_json(json_response: str) -> str:
+    """Robust final answer extraction with repairs."""
+    extracted = robust_json_extractor(json_response)
+    if not extracted:
+        return "No final answer provided"
+    
+    # Try parsed
+    try:
+        data = json.loads(extracted)  # Use same repairs implicitly via extractor
+        return data.get('final_answer', '').strip()
+    except:
+        pass
+    
+    # Regex with flexibility
+    patterns = [
+        r'"final_answer"\s*:\s*"([^"]*)"',
+        r'final_answer\s*:\s*"([^"]*)"',  # Unquoted key
+        r'"final_answer"\s*:\s*([^{},]+)',  # Non-quoted value
+    ]
+    for pat in patterns:
+        match = re.search(pat, extracted, re.DOTALL | re.IGNORECASE)
+        if match:
+            ans = match.group(1).strip().replace('\\"', '"')
+            if len(ans) > 5:
+                return ans[:500]  # Truncate long ones
+    
+    # Semantic fallback: Last text after "final" or "answer"
+    if 'final_answer' in json_response.lower() or 'answer' in json_response.lower():
+        last_part = re.split(r'final\s*answer', json_response, flags=re.IGNORECASE)[-1]
+        lines = [l.strip() for l in last_part.split('\n') if l.strip() and len(l.strip()) > 20]
+        if lines:
+            return lines[0][:200]
+    
     return "No final answer provided"
 
-def generate_candidates_with_retry(query, num_candidates=3, model=OLLAMA_MODEL, max_retries=3):
-    """Generate candidates with structured parsing."""
+def generate_single_candidate(query, candidate_num=0, model=OLLAMA_MODEL, max_retries=3):
+    """
+    Generate a single candidate with JSON output format.
+    
+    Args:
+        query: The question to answer
+        candidate_num: Candidate identifier (for logging)
+        model: Ollama model to use
+        max_retries: Maximum retry attempts
+    
+    Returns:
+        Dictionary with structured candidate data or None if failed
+    """
     
     for attempt in range(max_retries):
         try:
-            timeout = 180 + (attempt * 60)
+            timeout = 240 + (attempt * 200)
             
-            prompt = f"""Generate {num_candidates} different step-by-step science explanations for: {query}
+            prompt = f"""Generate a step-by-step scientific explanation for the following query: {query}
 
-CRITICAL FORMAT (use EXACTLY as shown):
-Step 1 [FACTUAL] [GRANULAR]: key information text here
-Step 2 [PROCEDURAL] [INTERMEDIATE]: process text here
-Step 3 [EPISODIC] [GENERAL]: reasoning text here
-Step 4 [CONTEXTUAL] [INTERMEDIATE]: contextual information text here
-Step 5 [CONCEPTUAL] [GENERAL]: conclusion text here
-Final Answer: complete answer here
+CRITICAL INSTRUCTIONS:
+1. Output MUST be valid JSON only (no markdown, no extra text, no introductory sentence before the JSON output).
+2. Use the exact schema below.
+3. Include 10-100 segments (minimum 10, recommended 50, maximum 100)
+4. Each segment must have all 4 fields: seg_id, compartment, hierarchy, text
 
-RULES:
-- Use square brackets [ ] ONLY (no parentheses)
-- Always include BOTH compartment AND hierarchy
-- Always end brackets with a colon :
-- No extra spaces inside brackets
-- Divide answer into 'n' steps.
-- Valid compartments: FACTUAL, PROCEDURAL, EPISODIC, CONTEXTUAL, CONCEPTUAL
-- Valid hierarchies: GRANULAR, INTERMEDIATE, GENERAL
+VALID VALUES:
+- "compartment": FACTUAL, PROCEDURAL, EPISODIC, CONTEXTUAL, CONCEPTUAL
+- "hierarchy": GRANULAR, INTERMEDIATE, GENERAL
 
-Generate {num_candidates} candidates, separated by blank lines."""
+OUTPUT SCHEMA:
+{{
+  "segments": [
+    {{
+      "seg_id": 0,
+      "compartment": "CONTEXTUAL",
+      "hierarchy": "INTERMEDIATE",
+      "text": "According to scientific principles, we begin by..."
+    }},
+    {{
+      "seg_id": 1,
+      "compartment": "FACTUAL",
+      "hierarchy": "GRANULAR",
+      "text": "The mathematical formula is expressed as..."
+    }},
+    {{
+      "seg_id": 2,
+      "compartment": "CONCEPTUAL",
+      "hierarchy": "GENERAL",
+      "text": "This concept relates to the broader theory..."
+    }}
+  ],
+  "final_answer": "Brief summary of the complete explanation"
+}}
 
+REQUIREMENTS:
+- Start seg_id from 0 and increment sequentially
+- Ensure JSON is properly formatted (escaped quotes, valid syntax).
+- Each text field should be detailed and substantive.
+- Mix different compartments and hierarchies logically throughout.
+- Minimum 20 segments required for acceptance.
 
-            logger.debug(f"Ollama request (attempt {attempt + 1}):")
-            logger.debug(f"  Query: {query[:100]}...")
+Generate the JSON-only response now:"""
+            
+            logger.debug(f"Requesting candidate {candidate_num} (attempt {attempt + 1})...")
             
             response = requests.post(
                 'http://localhost:11434/api/generate',
@@ -1596,61 +1741,103 @@ Generate {num_candidates} candidates, separated by blank lines."""
                     'prompt': prompt,
                     'stream': False,
                     'options': {
-                        'num_predict': 1024,
-                        'temperature': 0.7,
-                        'num_ctx': 4096
+                        'num_predict': 8000,  # Increased for JSON output
+                        'temperature': 0.7 + (candidate_num * 0.1),  # Vary temperature per candidate
+                        'num_ctx': 4096,
+                        'top_p': 0.85,
+                        'repeat_penalty': 1.15,
+                        'stop': ['Here is', 'Output:']  # Stop rambling
                     }
                 },
                 timeout=timeout
             )
             
             if response.status_code == 200:
-                raw = response.json().get('response', '')
+                raw = response.json().get('response', '').strip()
                 
-                logger.info(f"raw output item stage 3 = {raw}")
+                logger.debug(f"Raw JSON response (candidate {candidate_num}): {raw[:200]}...")
                 
-                if not raw.strip() or "Step 1" not in raw:
-                    raise ValueError("Invalid response format")
+                # Clean potential markdown wrapping
+                if raw.startswith('```'):
+                    raw = re.sub(r'^```(?:json)?\s*', '', raw)
+                    raw = re.sub(r'```\s*$', '', raw)
+                    raw = raw.strip()
                 
-                candidates = []
-                candidate_blocks = raw.split('\n\n')
+                # Parse JSON segments
+                steps = parse_json_segments(raw)
                 
-                for i, block in enumerate(candidate_blocks[:num_candidates]):
-                    steps = parse_compartment_cot(block)
+                if len(steps) >= 10:  # Minimum requirement
+                    final_ans = extract_final_answer_from_json(raw)
                     
-                    if len(steps) >= 2:
-                        final_ans = extract_final_answer(block)
-                        
-                        candidates.append({
-                            'candidate_id': chr(65 + i),
-                            'reasoning_chain': steps,
-                            'final_answer': final_ans,
-                            'reward_score': 0.5 + i * 0.2,
-                            'raw_text': block
-                        })
-                
-                if len(candidates) >= 2:
-                    logger.debug(f"✓ Generated {len(candidates)} structured candidates")
-                    return candidates[:3]
+                    candidate_data = {
+                        'candidate_id': chr(65 + candidate_num),  # A, B, C, ...
+                        'reasoning_chain': steps,
+                        'final_answer': final_ans,
+                        'reward_score': 0.5 + (candidate_num * 0.15),  # Varied scoring
+                        'raw_text': raw
+                    }
+                    
+                    logger.info(f"✓ Generated candidate {chr(65 + candidate_num)} with {len(steps)} segments")
+                    return candidate_data
                 else:
-                    raise ValueError(f"Only {len(candidates)} valid candidates")
+                    raise ValueError(f"Only {len(steps)} segments parsed (minimum 10 required)")
             
             raise ValueError(f"Ollama status {response.status_code}")
         
-        except (requests.Timeout, requests.ConnectionError, ValueError) as e:
+        except (requests.Timeout, requests.ConnectionError, ValueError, json.JSONDecodeError) as e:
             wait_time = (2 ** attempt) + random.uniform(0, 1)
-            logger.warning(f"  Retry {attempt + 1} (error: {type(e).__name__})")
-            logger.warning(f"  Waiting {wait_time:.1f}s...")
+            logger.warning(f"  Candidate {candidate_num} attempt {attempt + 1} failed: {type(e).__name__}")
+            logger.warning(f"  Waiting {wait_time:.1f}s before retry...")
             time.sleep(wait_time)
             
             if attempt == max_retries - 1:
-                logger.error(f"✗ Failed after {max_retries} attempts")
-                return []
+                logger.error(f"✗ Failed to generate candidate {candidate_num} after {max_retries} attempts")
+                return None
     
-    return []
+    return None
 
+
+def generate_candidates_looped(query, num_candidates=3, model=OLLAMA_MODEL):
+    """
+    Generate multiple candidates by looping individual requests.
+    
+    Args:
+        query: The question to answer
+        num_candidates: Number of candidates to generate
+        model: Ollama model to use
+    
+    Returns:
+        List of candidate dictionaries
+    """
+    candidates = []
+    
+    logger.info(f"Generating {num_candidates} candidates (sequential with cooling)...")
+    
+    for i in range(num_candidates):
+        logger.info(f"  → Candidate {i+1}/{num_candidates}...")
+        
+        candidate = generate_single_candidate(query, candidate_num=i, model=model)
+        
+        if candidate:
+            candidates.append(candidate)
+            logger.info(f"    ✓ Success: {len(candidate['reasoning_chain'])} segments")
+        else:
+            logger.warning(f"    ✗ Failed to generate candidate {i+1}")
+        
+        # Cooling delay between candidates (except after last)
+        if i < num_candidates - 1:
+            cooldown = 2.0  # 2 seconds between candidates
+            logger.debug(f"    Cooling {cooldown}s...")
+            time.sleep(cooldown)
+    
+    logger.info(f"Completed: {len(candidates)}/{num_candidates} candidates generated")
+    return candidates
+
+
+# Modified checkpoint section
 stage3_file = os.path.join(OUTPUT_PATH, "stage3_rlaif.jsonl")
 stage3_checkpoint = load_checkpoint("stage3_progress")
+
 
 if stage3_checkpoint:
     stage3_data = stage3_checkpoint.get("stage3_data", [])
@@ -1663,11 +1850,13 @@ else:
     processed_query_indices = set()
     logger.info("Starting fresh Stage 3...")
 
+
 # Validate docdata
 if not doc_data:
     doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
     if doc_data_checkpoint:
         doc_data = doc_data_checkpoint["doc_data"]
+
 
 if not doc_data or len(doc_data) == 0:
     logger.error("❌ Stage 3 requires docdata from Stage 1/2")
@@ -1677,8 +1866,10 @@ if not doc_data or len(doc_data) == 0:
 sample_queries = [(idx, data["query"]) for idx, data in doc_data.items()]
 logger.info(f"Processing {len(sample_queries)} queries")
 
+
 total_processed = len(processed_query_indices)
 last_written_idx = 0
+
 
 # Process in batches
 for batch_start in range(0, len(sample_queries), STAGE3_BATCH_SIZE):
@@ -1698,38 +1889,33 @@ for batch_start in range(0, len(sample_queries), STAGE3_BATCH_SIZE):
         logger.info("  No new queries in this batch, skipping...")
         continue
     
-    logger.info(f"  Processing {len(queries_to_process)} queries in parallel...")
+    logger.info(f"  Processing {len(queries_to_process)} queries...")
     
-    # Initialize rate limiter
-    rate_limiter = RateLimitedExecutor(max_workers=STAGE3_MAX_WORKERS, 
-                                       requests_per_second=STAGE3_REQUESTS_PER_SEC)
-    
-    # Define processing function (with proper scope)
-    def process_single_query(item):
-        global_idx, doc_idx, query = item
-        
-        logger.info(f"  Query {global_idx}: {query[:100]}...")
+    # Process queries sequentially (looped candidate generation handles parallelism internally)
+    for global_idx, doc_idx, query in queries_to_process:
+        logger.info(f"\\n  Query {global_idx}: {query[:100]}...")
         
         try:
-            candidates = generate_candidates_with_retry(query)
-            time.sleep(0.5)  # Additional safety delay
+            # Generate 3 candidates via looped individual requests
+            candidates = generate_candidates_looped(query, num_candidates=3)
             
-            if len(candidates) >= 2:
+            if len(candidates) >= 2:  # Minimum 2 candidates required
                 # Create AI feedback
+                sorted_candidates = sorted(candidates, key=lambda x: x["reward_score"], reverse=True)
+                
                 ai_feedback = {
-                    "ranking": [c["candidate_id"] for c in sorted(candidates, 
-                                key=lambda x: x["reward_score"], reverse=True)],
+                    "ranking": [c["candidate_id"] for c in sorted_candidates],
                     "criteria": {
-                        "logical_flow": [0.9, 0.8, 0.6],
-                        "accuracy": [0.95, 0.85, 0.7],
-                        "completeness": [0.9, 0.8, 0.5]
+                        "logical_flow": [0.9 - (i * 0.1) for i in range(len(candidates))],
+                        "accuracy": [0.95 - (i * 0.1) for i in range(len(candidates))],
+                        "completeness": [0.9 - (i * 0.15) for i in range(len(candidates))]
                     },
-                    "critique": {c["candidate_id"]: f"Quality {c['reward_score']:.2f}" 
+                    "critique": {c["candidate_id"]: f"Quality score {c['reward_score']:.2f}" 
                                 for c in candidates},
                     "preference_pairs": [
-                        {"winner": candidates[0]["candidate_id"], 
-                         "loser": candidates[j]["candidate_id"]}
-                        for j in range(1, len(candidates))
+                        {"winner": sorted_candidates[0]["candidate_id"], 
+                         "loser": sorted_candidates[j]["candidate_id"]}
+                        for j in range(1, len(sorted_candidates))
                     ]
                 }
                 
@@ -1741,43 +1927,24 @@ for batch_start in range(0, len(sample_queries), STAGE3_BATCH_SIZE):
                     "preference_pairs": ai_feedback["preference_pairs"]
                 }
                 
-                return (global_idx, stage3_sample)
-            else:
-                logger.warning(f"  Failed for query {global_idx}: insufficient candidates")
-                return None
+                stage3_data.append(stage3_sample)
+                processed_query_indices.add(global_idx)
+                total_processed += 1
                 
+                logger.info(f"  ✓ Created sample for query {global_idx}")
+            else:
+                logger.warning(f"  ✗ Failed for query {global_idx}: only {len(candidates)} candidates")
+        
         except Exception as e:
-            logger.error(f"  Error processing query {global_idx}: {e}")
-            return None
+            logger.error(f"  ✗ Error processing query {global_idx}: {e}")
+            continue
     
-    # Run in parallel
-    try:
-        results = rate_limiter.map(process_single_query, queries_to_process)
-    except Exception as e:
-        logger.error(f"Parallel processing failed: {e}")
-        results = []
-    finally:
-        rate_limiter.shutdown()
-    
-    # Process results
-    successful = 0
-    for result in results:
-        if result:
-            global_idx, stage3_sample = result
-            stage3_data.append(stage3_sample)
-            processed_query_indices.add(global_idx)
-            total_processed += 1
-            successful += 1
-            logger.info(f"  ✓ Created sample for query {global_idx}")
-    
-    logger.info(f"  Batch complete: {successful}/{len(queries_to_process)} successful")
-    
-    # Checkpoint every batch
+    # Checkpoint after each batch
     if last_written_idx < len(stage3_data):
-        logger.info(f"  Writing {len(stage3_data) - last_written_idx} samples...")
+        logger.info(f"\\n  Writing {len(stage3_data) - last_written_idx} samples...")
         with open(stage3_file, "a", encoding="utf-8") as f:
             for item in stage3_data[last_written_idx:]:
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                f.write(json.dumps(item, ensure_ascii=False) + "\\n")
         last_written_idx = len(stage3_data)
         
         save_checkpoint({
@@ -1789,25 +1956,30 @@ for batch_start in range(0, len(sample_queries), STAGE3_BATCH_SIZE):
     
     # Cooling delay between batches
     if batch_end < len(sample_queries):
-        logger.info(f"  Cooling down {STAGE3_BATCH_DELAY}s...")
+        logger.info(f"\\n  Batch cooling down {STAGE3_BATCH_DELAY}s...")
         time.sleep(STAGE3_BATCH_DELAY)
+
 
 # Final write
 if last_written_idx < len(stage3_data):
-    logger.info(f"Writing final samples...")
+    logger.info(f"\\nWriting final samples...")
     with open(stage3_file, "a", encoding="utf-8") as f:
         for item in stage3_data[last_written_idx:]:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            f.write(json.dumps(item, ensure_ascii=False) + "\\n")
+
 
 logger.info("="*80)
 logger.info(f"STAGE 3 COMPLETE")
 logger.info("="*80)
 logger.info(f"Total samples: {len(stage3_data)}")
+logger.info(f"Successful rate: {len(stage3_data)}/{len(sample_queries)} ({100*len(stage3_data)/len(sample_queries):.1f}%)")
+
 
 save_checkpoint({
     "stage3_data": stage3_data,
     "processed_indices": list(processed_query_indices)
 }, "stage3_progress")
+
 
 logger.info("="*80)
 logger.info("PIPELINE COMPLETE - SCM COMPLIANT DATASET GENERATED")
