@@ -959,25 +959,32 @@ class Stage3RLAIFDataset(Dataset):
                 try:
                     sample = json.loads(line.strip())
                     
-                    # Validate required fields
-                    if 'query' not in sample or 'response' not in sample or 'score' not in sample:
+                    # ✅ FIX: Handle candidates structure from generated dataset
+                    if 'query' not in sample or 'candidates' not in sample:
                         continue
-                    
-                    # Extract embeddings from response chain
-                    response_chain = sample.get('response_chain', [])
+
+                    # Extract best candidate (highest reward_score)
+                    candidates = sample.get('candidates', [])
+                    if len(candidates) == 0:
+                        continue
+
+                    best_candidate = max(candidates, key=lambda x: x.get('reward_score', 0))
+                    response_chain = best_candidate.get('reasoning_chain', [])
+                    score = best_candidate.get('reward_score', 0.5)
+
                     if len(response_chain) < 2:
                         continue
-                    
+
                     valid = all('sonar_embedding' in step and len(step['sonar_embedding']) == 1024 
-                               for step in response_chain)
+                            for step in response_chain)
                     if not valid:
                         continue
-                    
+
                     self.samples.append({
                         'query': sample['query'],
-                        'response_chain': response_chain,
-                        'score': sample['score'],  # AI quality score (0-1)
-                        'domain': sample.get('domain', 'general')
+                        'response_chain': response_chain,  # ✅ Extracted from best candidate
+                        'score': score,                     # ✅ Extracted from best candidate
+                        'domain': sample.get('domain', 'general')  # ✅ May be missing in old data
                     })
                 
                 except (json.JSONDecodeError, KeyError) as e:
@@ -985,6 +992,29 @@ class Stage3RLAIFDataset(Dataset):
         
         logger.info(f"Loaded {len(self.samples)} Stage 3 RLAIF samples")
     
+    # def _extract_best_candidate(self, sample):
+    #     """
+    #     Extract best candidate from multi-candidate format.
+    #     Handles both old and new dataset formats.
+    #     """
+    #     # New format: {"candidates": [...]}
+    #     if 'candidates' in sample:
+    #         candidates = sample['candidates']
+    #         if len(candidates) > 0:
+    #             best = max(candidates, key=lambda x: x.get('reward_score', 0))
+    #             return {
+    #                 'response_chain': best.get('reasoning_chain', []),
+    #                 'score': best.get('reward_score', 0.5),
+    #                 'domain': sample.get('domain', 'general')
+    #             }
+        
+    #     # Old format: direct keys
+    #     return {
+    #         'response_chain': sample.get('response_chain', []),
+    #         'score': sample.get('score', 0.5),
+    #         'domain': sample.get('domain', 'general')
+    #     }
+
     def __len__(self):
         return len(self.samples)
     

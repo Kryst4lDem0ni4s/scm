@@ -1797,7 +1797,7 @@ Generate the JSON-only response now:"""
     return None
 
 
-def generate_candidates_looped(query, num_candidates=3, model=OLLAMA_MODEL):
+def generate_candidates_looped(query, num_candidates=2, model=OLLAMA_MODEL):
     """
     Generate multiple candidates by looping individual requests.
     
@@ -1944,7 +1944,7 @@ for batch_start in range(0, len(sample_queries), STAGE3_BATCH_SIZE):
         logger.info(f"\\n  Writing {len(stage3_data) - last_written_idx} samples...")
         with open(stage3_file, "a", encoding="utf-8") as f:
             for item in stage3_data[last_written_idx:]:
-                f.write(json.dumps(item, ensure_ascii=False) + "\\n")
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
         last_written_idx = len(stage3_data)
         
         save_checkpoint({
@@ -1965,7 +1965,7 @@ if last_written_idx < len(stage3_data):
     logger.info(f"\\nWriting final samples...")
     with open(stage3_file, "a", encoding="utf-8") as f:
         for item in stage3_data[last_written_idx:]:
-            f.write(json.dumps(item, ensure_ascii=False) + "\\n")
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 logger.info("="*80)
