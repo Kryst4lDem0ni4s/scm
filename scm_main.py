@@ -35,6 +35,11 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from tqdm import tqdm
+from torch.optim.swa_utils import AveragedModel, SWALR
+
+# ═══════════════════════════════════════════════════════════════════
+# CONFIGURATION - MODIFY THESE PATHS FOR YOUR SYSTEM
+# ═══════════════════════════════════════════════════════════════════
 
 def setup_cuda():
     """Ensure PyTorch with CUDA 12.x is installed"""
@@ -51,18 +56,18 @@ def setup_cuda():
         pass
     
     # Install PyTorch with CUDA 12.1
-    print("⚠️ Installing PyTorch with CUDA 12.1 support...")
+    print("⚠ Installing PyTorch with CUDA 12.9 support...")
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "--upgrade",
-        "torch==2.2.0+cu121", 
-        "torchvision==0.17.0+cu121", 
-        "torchaudio==2.2.0+cu121",
-        "--extra-index-url", "https://download.pytorch.org/whl/cu121"
+        "torch", 
+        "torchvision", 
+        "torchaudio",
+        "--extra-index-url", "https://download.pytorch.org/whl/cu128"
     ])
     
     import torch
     assert torch.cuda.is_available(), "❌ CUDA installation failed"
-    print(f"✅ PyTorch {torch.__version__} installed with CUDA {torch.version.cuda}")
+    print(f"✅ PyTorch {torch._version_} installed with CUDA {torch.version.cuda}")
     return True
 
 # Run setup
@@ -93,7 +98,7 @@ class SCMConfig:
     LEARNING_RATE = 3e-4  # Initial learning rate
     WEIGHT_DECAY = 0.01  # L2 regularization
     MAX_EPOCHS = 10  # Maximum training epochs
-    WARMUP_STEPS = 1000  # Learning rate warmup steps
+    WARMUP_STEPS = None  # Learning rate warmup steps
     GRADIENT_CLIP = 1.0  # Gradient clipping threshold
     
     # Loss Weights
@@ -106,7 +111,7 @@ class SCMConfig:
     FP16_PRECISION_WEIGHT = 1.0  # Weight for FP16-acceptable samples
     
     # Data Paths
-    BASE_PATH = Path(r"C:\Users\Khwaish\Google Drive Streaming\My Drive\scm_project")
+    BASE_PATH = Path(r"G:\My Drive\scm_project")
     STAGE1_JSONL = BASE_PATH / "datasets" / "processed" / "stage1_pretrain.jsonl"
     STAGE2_JSONL = BASE_PATH / "datasets" / "processed" / "stage2_sft.jsonl"
     STAGE3_JSONL = BASE_PATH / "datasets" / "processed" / "stage3_rlaif.jsonl"
@@ -118,8 +123,14 @@ class SCMConfig:
     VALID_HIERARCHIES = {'GRANULAR', 'INTERMEDIATE', 'GENERAL'}
     VALID_PRECISIONS = {'fp32', 'fp16'}
     
+    RUN_LR_FINDER = True # Change after fresh runs
+    
     # Device
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    DEVICE = torch.device("cuda")
+    print("Device:", str(DEVICE))
+    if str(DEVICE)!="cuda":
+        torch.set_default_device('cuda')
+        DEVICE = "cuda"
     
     DOMAIN_VOCAB_SIZES = {
         'general': 8000,
@@ -975,8 +986,14 @@ class Stage3RLAIFDataset(Dataset):
                     if len(response_chain) < 2:
                         continue
 
-                    valid = all('sonar_embedding' in step and len(step['sonar_embedding']) == 1024 
-                            for step in response_chain)
+                    # ✅ FIX: Check if sonar_embedding exists AND is not None
+                    valid = all(
+                        'sonar_embedding' in step 
+                        and step['sonar_embedding'] is not None  # ✅ Check for None
+                        and len(step['sonar_embedding']) == 1024 
+                        for step in response_chain
+                    )
+                    
                     if not valid:
                         continue
 
@@ -1133,6 +1150,22 @@ def collate_stage2(batch):
 # LOSS FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════
 
+class LabelSmoothingCrossEntropy(nn.Module):
+    def __init__(self, smoothing: float = 0.1):
+        super().__init__()
+        self.smoothing = smoothing
+    
+    def forward(self, pred, target):
+        n_classes = pred.size(-1)
+        log_probs = F.log_softmax(pred, dim=-1)
+        
+        with torch.no_grad():
+            true_dist = torch.zeros_like(log_probs)
+            true_dist.fill_(self.smoothing / (n_classes - 1))
+            true_dist.scatter_(1, target.unsqueeze(1), 1.0 - self.smoothing)
+        
+        return torch.mean(torch.sum(-true_dist * log_probs, dim=-1))
+
 class SCMLoss(nn.Module):
     """
     SCM Multi-Objective Loss Function
@@ -1150,7 +1183,8 @@ class SCMLoss(nn.Module):
 
         self.compartment_to_idx = {c: i for i, c in enumerate(COMPARTMENT_ORDER)}
         self.hierarchy_to_idx = {h: i for i, h in enumerate(HIERARCHY_ORDER)}
-
+        self.ce_loss = LabelSmoothingCrossEntropy(smoothing=0.1)
+        
     def forward(
         self, 
         outputs: Dict[str, torch.Tensor],
@@ -1199,8 +1233,9 @@ class SCMLoss(nn.Module):
             device=hier_logits.device
         )
         
-        l_comp = F.cross_entropy(comp_logits, comp_labels)
-        l_hier = F.cross_entropy(hier_logits, hier_labels)
+        
+        l_comp = self.ce_loss(comp_logits, comp_labels)
+        l_hier = self.ce_loss(hier_logits, hier_labels)
         l_domain = (l_comp + l_hier) / 2
         
         # L_efficiency = λ × param_count + μ × inference_time
@@ -1224,11 +1259,18 @@ class SCMLoss(nn.Module):
     def _stage2_loss(self, outputs, targets):
         """Stage 2: Autoregressive Concept Prediction"""
         # Shift targets by 1
-        pred_concepts = outputs['concept_predictions'][:, :-1, :]  # [B, L-1, 384]
-        target_concepts = outputs['compressed_concepts'][:, 1:, :]  # [B, L-1, 384]
+        # ✅ FIX: Get compressed concepts (B, L, 384)
+        all_concepts = outputs['compressed_concepts']  # (B, L, 384)
         
-        # Attention mask (exclude padding from loss)
-        mask = targets['attention_mask'][:, 1:].unsqueeze(-1)  # [B, L-1, 1]
+        # ✅ FIX: Slice predictions to exclude last position (B, L-1, 384)
+        # concept_predictions has shape (B, L, 384), we need (B, L-1, 384)
+        pred_concepts = outputs['concept_predictions'][:, :-1, :]  # (B, L-1, 384)
+        
+        # ✅ FIX: Target is next concept (shift by 1)
+        target_concepts = all_concepts[:, 1:, :]  # (B, L-1, 384)
+        
+        # ✅ FIX: Mask also needs to match (B, L-1, 1)
+        mask = targets['attention_mask'][:, 1:].unsqueeze(-1)  # (B, L-1, 1)
         
         # Precision-aware weighting
         batch_size, seq_len = targets['attention_mask'].shape
@@ -1249,35 +1291,51 @@ class SCMLoss(nn.Module):
         
         # Concept prediction loss (with precision weighting)
         l_concept = F.mse_loss(
-            pred_concepts * weighted_mask,
-            target_concepts * weighted_mask,
+            pred_concepts * mask,
+            target_concepts * mask,
             reduction='sum'
-        ) / (weighted_mask.sum() + 1e-8)  # ✅ Correct normalization with epsilon
+        ) / (mask.sum() + 1e-8)  # ✅ Normalize by valid positions only  # ✅ Correct normalization with epsilon
         
         # Domain classification loss (same as before)
-        comp_logits = outputs['compartment_logits'].view(-1, len(self.compartment_to_idx))
-        hier_logits = outputs['hierarchy_logits'].view(-1, len(self.hierarchy_to_idx))
+        comp_logits = outputs['compartment_logits']  # (B, seq_len, 5)
+        hier_logits = outputs['hierarchy_logits']  # (B, seq_len, 3)
+        
+        batch_size, seq_len = targets['attention_mask'].shape
         
         comp_labels = []
         hier_labels = []
+        valid_positions = []
+        
         for b in range(batch_size):
             for s in range(seq_len):
-                if targets['attention_mask'][b, s] > 0:
-                    comp_labels.append(self.compartment_to_idx.get(targets['compartments'][b][s], 0))
-                    hier_labels.append(self.hierarchy_to_idx.get(targets['hierarchies'][b][s], 0))
-                else:
-                    comp_labels.append(0)
-                    hier_labels.append(0)
+                if targets['attention_mask'][b, s] > 0:  # ✅ Only valid positions
+                    comp_labels.append(
+                        self.compartment_to_idx.get(targets['compartments'][b][s], 0)
+                    )
+                    hier_labels.append(
+                        self.hierarchy_to_idx.get(targets['hierarchies'][b][s], 0)
+                    )
+                    valid_positions.append(b * seq_len + s)
         
-        comp_labels = torch.tensor(comp_labels, device=comp_logits.device)
-        hier_labels = torch.tensor(hier_labels, device=hier_logits.device)
+        if len(valid_positions) == 0:
+            # No valid positions (shouldn't happen)
+            l_domain = torch.tensor(0.0, device=comp_logits.device)
+        else:
+            # Flatten and select only valid positions
+            comp_logits_flat = comp_logits.view(-1, len(self.compartment_to_idx))
+            hier_logits_flat = hier_logits.view(-1, len(self.hierarchy_to_idx))
+            
+            comp_logits_valid = comp_logits_flat[valid_positions]
+            hier_logits_valid = hier_logits_flat[valid_positions]
+            
+            comp_labels_tensor = torch.tensor(comp_labels, device=comp_logits.device)
+            hier_labels_tensor = torch.tensor(hier_labels, device=hier_logits.device)
+            
+            l_comp = F.cross_entropy(comp_logits_valid, comp_labels_tensor)
+            l_hier = F.cross_entropy(hier_logits_valid, hier_labels_tensor)
+            l_domain = (l_comp + l_hier) / 2
         
-        valid_mask = targets['attention_mask'].view(-1) > 0
-        l_comp = F.cross_entropy(comp_logits[valid_mask], comp_labels[valid_mask])
-        l_hier = F.cross_entropy(hier_logits[valid_mask], hier_labels[valid_mask])
-        l_domain = (l_comp + l_hier) / 2
-        
-        # Total loss (no double-weighting)
+        # Total loss
         total_loss = (
             self.config.ALPHA_CONCEPT * l_concept +
             self.config.BETA_DOMAIN * l_domain
@@ -1293,6 +1351,102 @@ class SCMLoss(nn.Module):
 # ═══════════════════════════════════════════════════════════════════
 # TRAINER
 # ═══════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════
+# TRAINING UTILITIES
+# ═══════════════════════════════════════════════════════════════════
+
+class EarlyStopping:
+    """Early stopping to prevent overfitting"""
+    def __init__(self, patience: int = 5, min_delta: float = 0.001, mode: str = 'min'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.logger = logging.getLogger(__name__)
+        
+    def __call__(self, val_loss: float) -> bool:
+        score = -val_loss if self.mode == 'min' else val_loss
+        
+        if self.best_score is None:
+            self.best_score = score
+        elif score < self.best_score + self.min_delta:
+            self.counter += 1
+            self.logger.info(f"EarlyStopping counter: {self.counter}/{self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.counter = 0
+        
+        return self.early_stop
+
+class ModelEMA:
+    """Exponential Moving Average of model parameters"""
+    def __init__(self, model, decay=0.9999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+    
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
+                self.shadow[name] = new_average.clone()
+    
+    def apply_shadow(self):
+        """Apply EMA weights for evaluation"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
+    
+    def restore(self):
+        """Restore original weights"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.data = self.backup[name]
+
+class SCMMetrics:
+    """Track multiple evaluation metrics"""
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self.total_loss = 0.0
+        self.concept_mse = 0.0
+        self.domain_acc = 0.0
+        self.embedding_sim = 0.0
+        self.count = 0
+    
+    def update(self, loss_val, l_concept):
+        self.total_loss += loss_val
+        self.concept_mse += l_concept
+        self.count += 1
+    
+    def compute(self):
+        if self.count == 0:
+            return {'loss': 0.0, 'perplexity': float('inf'), 'concept_mse': 0.0}
+        
+        avg_loss = self.total_loss / self.count
+        
+        if isinstance(avg_loss, torch.Tensor):
+            avg_loss_value = avg_loss.cpu().item()
+        else:
+            avg_loss_value = avg_loss
+            
+        return {
+            'loss': avg_loss_value,
+            'perplexity': np.exp(avg_loss_value),
+            'concept_mse': self.concept_mse / self.count
+        }
 
 class SCMTrainer:
     """SCM Training Pipeline"""
@@ -1313,12 +1467,23 @@ class SCMTrainer:
             weight_decay=config.WEIGHT_DECAY
         )
         
-        # Initialize scheduler
-        self.scheduler = CosineAnnealingWarmRestarts(
+        # ✅ NEW: Improved scheduler with warmup + plateau detection
+        # from torch.optim.lr_scheduler import ReduceLROnPlateau
+        # self.main_scheduler = ReduceLROnPlateau(
+        #     self.optimizer, mode='min', factor=0.5, patience=3, verbose=True
+        # )
+        
+        from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+
+        self.main_scheduler = CosineAnnealingWarmRestarts(
             self.optimizer,
-            T_0=config.WARMUP_STEPS,
-            T_mult=2
+            T_0=500,      # Restart every 500 steps
+            T_mult=2,     # Double period after each restart
+            eta_min=1e-6  # Minimum LR
         )
+        
+        self.warmup_steps = config.WARMUP_STEPS
+        self.warmup_scheduler = None  # Will be set in training
         
         # Initialize loss function
         self.criterion = SCMLoss(config)
@@ -1329,13 +1494,199 @@ class SCMTrainer:
         
         # self.scaler = torch.GradScaler()  
         # ✅ ADD: Mixed precision scaler
-        self.use_amp = torch.cuda.is_available()  # Auto-enable on GPU
+        # self.use_amp = torch.cuda.is_available()  # Auto-enable on GPU
+        torch.set_default_device('cuda')
+        torch.get_default_device()
+        
+        self.use_amp = True
         self.scaler = torch.amp.GradScaler() if self.use_amp else torch.GradScaler()
 
         if self.use_amp:
             self.logger.info("✅ Mixed precision training enabled (FP16)")
+            
+        # ✅ NEW: EMA and early stopping
+        self.ema = ModelEMA(self.model, decay=0.9999)
+        self.early_stopping = {}  # Per-stage early stopping
+        self.grad_norm_history = []
     
-    def train_stage1(self, num_epochs: int = 3, max_samples: Optional[int] = None):
+    def set_warmup_steps(self, total_steps: int):
+        """Set warmup to 10% of total training steps"""
+        self.warmup_steps = max(100, int(0.1 * total_steps))
+        self.logger.info(f"Warmup steps: {self.warmup_steps} (10% of {total_steps})")
+       
+       
+    def find_optimal_lr(self, dataset, num_steps=100):
+        """LR range test (Leslie Smith method)"""
+        from torch.utils.data import DataLoader
+        
+        if self.device.type == 'cuda':
+            generator = torch.Generator(device=self.device)
+        else:
+            generator = None
+
+        temp_loader = DataLoader(
+            dataset, 
+            batch_size=self.config.BATCH_SIZE,
+            shuffle=False, 
+            collate_fn=collate_stage1,
+            num_workers=0,
+            pin_memory=False,  # ✅ Must be False (data already on CUDA)
+            generator=generator  # ✅ Add CUDA generator
+        )
+        
+        start_lr, end_lr = 1e-7, 1e-2
+        lr_mult = (end_lr / start_lr) ** (1 / num_steps)
+        lr = start_lr
+        
+        lrs, losses = [], []
+        
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+        
+        for i, batch in enumerate(temp_loader):
+            if i >= num_steps:
+                break
+            
+            self.optimizer.zero_grad()
+            clean_emb = batch['clean_embedding'].unsqueeze(1).to(self.device)
+            noisy_emb = batch['noisy_embedding'].unsqueeze(1).to(self.device)
+            
+            outputs = self.model(noisy_emb, use_causal_mask=False)
+            loss_dict = self.criterion(
+                outputs,
+                {
+                    'clean_embedding': clean_emb.squeeze(1),
+                    'compartments': batch['compartments'],
+                    'hierarchies': batch['hierarchies'],
+                    'precisions': batch['precisions'],
+                    'compressor': self.model.compressor
+                },
+                stage='stage1'
+            )
+            
+            loss = loss_dict['loss']
+            loss.backward()
+            self.optimizer.step()
+            
+            lrs.append(lr)
+            losses.append(loss.item())
+            
+            lr *= lr_mult
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+        
+        # Find LR with steepest descent
+        gradients = np.gradient(losses)
+        optimal_idx = np.argmin(gradients)
+        optimal_lr = lrs[optimal_idx]
+        
+        self.logger.info(f"📊 Optimal LR: {optimal_lr:.2e} (current: {self.config.LEARNING_RATE:.2e})")
+        
+        return optimal_lr, lrs, losses
+
+    def enable_swa(self, swa_start_epoch=2):
+        """Enable Stochastic Weight Averaging"""
+        self.swa_model = AveragedModel(self.model)
+        self.swa_scheduler = SWALR(
+            self.optimizer,
+            swa_lr=self.config.LEARNING_RATE * 0.1
+        )
+        self.swa_start_epoch = swa_start_epoch
+        self.logger.info(f"✅ SWA enabled (starts epoch {swa_start_epoch})")
+ 
+    def _validate_epoch(self, val_loader, stage: str = 'stage1') -> float:
+        """Run validation epoch"""
+        self.model.eval()
+        val_metrics = SCMMetrics()
+        
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Validation", leave=False):
+                if stage == 'stage1':
+                    clean_emb = batch['clean_embedding'].unsqueeze(1).to(self.device)
+                    noisy_emb = batch['noisy_embedding'].unsqueeze(1).to(self.device)
+                    
+                    outputs = self.model(noisy_emb, use_causal_mask=False)
+                    loss_dict = self.criterion(
+                        outputs,
+                        {
+                            'clean_embedding': clean_emb.squeeze(1),
+                            'compartments': batch['compartments'],
+                            'hierarchies': batch['hierarchies'],
+                            'precisions': batch['precisions'],
+                            'compressor': self.model.compressor
+                        },
+                        stage='stage1'
+                    )
+                    
+                    val_metrics.update(loss_dict['loss'], loss_dict['l_concept'])
+                
+                elif stage == 'stage2':
+                    embeddings = batch['embeddings'].to(self.device)
+                    attention_mask = batch['attention_mask'].to(self.device)
+                    
+                    outputs = self.model(embeddings, attention_mask=attention_mask)
+                    loss_dict = self.criterion(
+                        outputs,
+                        {
+                            'attention_mask': attention_mask,
+                            'compartments': batch['compartments'],
+                            'hierarchies': batch['hierarchies'],
+                            'precisions': batch['precisions']
+                        },
+                        stage='stage2'
+                    )
+                    
+                    val_metrics.update(loss_dict['loss'], loss_dict['l_concept'])
+        
+        self.model.train()
+        computed_metrics = val_metrics.compute()
+        perplexity = computed_metrics['perplexity']
+
+        self.logger.info(f"Val Loss: {computed_metrics['loss']:.4f}, Perplexity: {perplexity:.2f}")
+
+        return computed_metrics['loss']
+
+    def _validate_stage3(self, val_loader) -> float:
+        """Run validation for Stage 3 RLAIF"""
+        self.model.eval()
+        val_metrics = SCMMetrics()
+        
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Validation", leave=False):
+                embeddings = batch['embeddings'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                scores = batch['scores'].to(self.device)
+                
+                outputs = self.model(embeddings, attention_mask=attention_mask)
+                
+                # Compute concept loss
+                pred_concepts = outputs['concept_predictions'][:, :-1, :]
+                target_concepts = outputs['compressed_concepts'][:, 1:, :]
+                mask = attention_mask[:, 1:].unsqueeze(-1)
+                
+                l_concept = F.mse_loss(
+                    pred_concepts * mask,
+                    target_concepts * mask,
+                    reduction='sum'
+                ) / (mask.sum() + 1e-8)
+                
+                # Weight by reward
+                reward_weights = 1.0 - scores
+                weighted_loss = l_concept * reward_weights.mean()
+                
+                val_metrics.update(weighted_loss.item(), l_concept.item())
+        
+        self.model.train()
+        computed_metrics = val_metrics.compute()
+        perplexity = computed_metrics['perplexity']
+        
+        self.logger.info(f"Val Loss: {computed_metrics['loss']:.4f}, Perplexity: {perplexity:.2f}")
+        
+        return computed_metrics['loss']
+
+        
+    def train_stage1(self, num_epochs: int = 50, max_samples: Optional[int] = None, 
+                 resume: bool = True, val_split: float = 0.15):
         """
         Stage 1: Denoising Pre-training
         
@@ -1345,32 +1696,67 @@ class SCMTrainer:
         self.logger.info("STAGE 1: DENOISING PRE-TRAINING")
         self.logger.info("="*80)
         
-        # Load dataset
-        dataset = Stage1Dataset(self.config.STAGE1_JSONL, max_samples=max_samples, logger=self.logger)
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.config.BATCH_SIZE,
-            shuffle=True,
-            collate_fn=collate_stage1,
-            num_workers=0 if self.device.type == 'cuda' else 2,  # ✅ Disable multiprocessing on CUDA
-            pin_memory=True
+        full_dataset = Stage1Dataset(
+            self.config.STAGE1_JSONL, 
+            max_samples=max_samples, 
+            logger=self.logger
         )
+        
+        start_epoch = 0
+        if resume:
+            resume_info = self.auto_resume("stage1")
+            if resume_info:
+                start_epoch = resume_info['epoch']
+                # full_dataset = Stage1Dataset(self.config.STAGE1_JSONL, max_samples=max_samples, logger=self.logger)
+    
+        train_size = int((1 - val_split) * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+        
+        # ✅ Create CUDA-compatible generator
+        if self.device.type == 'cuda':
+            generator = torch.Generator(device='cuda').manual_seed(42)
+        else:
+            generator = torch.Generator().manual_seed(42)
+
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            full_dataset, 
+            [train_size, val_size],
+            generator=generator  # ✅ CUDA generator
+        )
+
+        self.logger.info(f"Split: {len(train_dataset)} train, {len(val_dataset)} val")
+        
+        train_loader = DataLoader(
+            train_dataset, batch_size=self.config.BATCH_SIZE, shuffle=False,
+            collate_fn=collate_stage1, num_workers=0, pin_memory=False
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=self.config.BATCH_SIZE, shuffle=False,
+            collate_fn=collate_stage1, num_workers=0, pin_memory=False
+        )
+        
+        total_steps = len(train_loader) * num_epochs // self.config.ACCUMULATION_STEPS
+        self.set_warmup_steps(total_steps)
+        
+        # ✅ Initialize early stopping
+        early_stopping = EarlyStopping(patience=5, min_delta=0.001)
         
         self.model.train()
         
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             epoch_loss = 0.0
             epoch_metrics = {'l_concept': 0.0, 'l_domain': 0.0, 'l_efficiency': 0.0}
             
-            pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
             self.optimizer.zero_grad()
-            for batch in pbar:
+            
+            for batch_idx, batch in enumerate(pbar):  
                 # Move to device
                 clean_emb = batch['clean_embedding'].unsqueeze(1).to(self.device)  # [B, 1, 1024]
                 noisy_emb = batch['noisy_embedding'].unsqueeze(1).to(self.device)
                 
                 # Forward pass (use noisy embeddings as input)
-                with torch.amp.autocast(enabled=self.use_amp):  # Enable FP16
+                with torch.amp.autocast(device_type=str(self.device), enabled=self.use_amp):  # Enable FP16
                     outputs = self.model(noisy_emb, use_causal_mask=False)
                     outputs['model'] = self.model  # Pass model for reconstruction
                     
@@ -1395,26 +1781,59 @@ class SCMTrainer:
                 else:
                     loss.backward()
 
-                # ✅ Only update weights every ACCUMULATION_STEPS
-                if (self.global_step + 1) % self.config.ACCUMULATION_STEPS == 0:
+                if (batch_idx + 1) % self.config.ACCUMULATION_STEPS == 0:
                     if self.use_amp:
                         self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.GRADIENT_CLIP)
+                        
+                        # ✅ Log gradient norm BEFORE clipping
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), max_norm=float('inf')
+                        )
+                        if batch_idx % 100 == 0:
+                            self.logger.debug(f"Grad norm: {grad_norm:.4f}")
+                        
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.config.GRADIENT_CLIP
+                        )
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.GRADIENT_CLIP)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.config.GRADIENT_CLIP
+                        )
                         self.optimizer.step()
+                        
+                    if epoch >= self.swa_start_epoch:
+                        self.swa_model.update_parameters(self.model)
+                        self.swa_scheduler.step()
+                        
+   
+                    # After line 1481 (after optimizer.step())
+                    if self.global_step % 1000 == 0:
+                        # Gradually increase weight decay
+                        new_wd = min(0.1, self.config.WEIGHT_DECAY * (1 + self.global_step / 100000))
+                        for param_group in self.optimizer.param_groups:
+                            param_group['weight_decay'] = new_wd
+
                     
                     self.optimizer.zero_grad()
-                    self.scheduler.step()
+                    
+                    # ✅ Warmup scheduler
+                    if self.global_step < self.warmup_steps:
+                        warmup_factor = (self.global_step + 1) / self.warmup_steps
+                        for param_group in self.optimizer.param_groups:
+                            param_group['lr'] = self.config.LEARNING_RATE * warmup_factor
+                    
+                    # ✅ Update EMA
+                    self.ema.update()
                 
                 self.global_step += 1
+                
                 
                 # Update metrics
                 epoch_loss += loss.item() * self.config.ACCUMULATION_STEPS
                 for key in epoch_metrics:
-                    epoch_metrics[key] += loss_dict[key] * self.config.ACCUMULATION_STEPS
+                    epoch_metrics[key] += loss_dict[key]
                 
                 # Update progress bar
                 pbar.set_postfix({
@@ -1422,24 +1841,43 @@ class SCMTrainer:
                     'l_concept': loss_dict['l_concept'],
                     'lr': self.optimizer.param_groups[0]['lr']
                 })
+                
+                if batch_idx > 0 and batch_idx % 500 == 0:
+                    self.save_checkpoint(
+                        f"stage1_epoch{epoch+1}_batch{batch_idx}.pt",
+                        epoch=epoch,
+                        batch_idx=batch_idx,
+                        stage="stage1"
+                    )
                             
             # Epoch summary
-            avg_loss = epoch_loss / len(dataloader)
-            self.logger.info(f"Epoch {epoch+1} - Avg Loss: {avg_loss:.4f}")
-            for key, val in epoch_metrics.items():
-                self.logger.info(f"  {key}: {val/len(dataloader):.4f}")
+            avg_train_loss = epoch_loss / len(train_loader)
+            self.ema.apply_shadow()
+            val_loss = self._validate_epoch(val_loader, stage='stage1')
+            self.ema.restore()
+        
+            self.logger.info(f"Epoch {epoch+1} - Train: {avg_train_loss:.4f}  (PPL: {np.exp(avg_train_loss):.2f}), Val: {val_loss:.4f} (PPL: {np.exp(val_loss):.2f})")
             
-            # Save checkpoint
-            if avg_loss < self.best_loss:
-                self.best_loss = avg_loss
-                self.save_checkpoint(f"stage1_best_epoch{epoch+1}.pt")
+            # ✅ Update scheduler based on validation loss
+            self.main_scheduler.step()
+            
+            # Save best model
+            if val_loss < self.best_loss:
+                self.best_loss = val_loss
+                self.save_checkpoint(f"stage1_best.pt", epoch=epoch+1, stage="stage1")
+            
+            # ✅ Early stopping check
+            if early_stopping(val_loss):
+                self.logger.info(f"⏹️ Early stopping at epoch {epoch+1}")
+                break
         
         self.logger.info("✅ Stage 1 training complete")
-    
-        # Always save final checkpoint
-        self.save_checkpoint(f"stage1_final_epoch{epoch+1}.pt")
-    
-    def train_stage2(self, num_epochs: int = 5, max_samples: Optional[int] = None):
+        torch.optim.swa_utils.update_bn(train_loader, self.swa_model)
+
+        self.save_checkpoint(f"stage1_final_epoch.pt", stage="stage1")
+        
+    def train_stage2(self, num_epochs: int = 100, max_samples: Optional[int] = None, 
+            resume: bool = True, val_split: float = 0.15):        
         """
         Stage 2: Supervised Fine-Tuning
         
@@ -1449,49 +1887,64 @@ class SCMTrainer:
         self.logger.info("STAGE 2: SUPERVISED FINE-TUNING")
         self.logger.info("="*80)
         
-        # Load dataset
-        dataset = Stage2Dataset(self.config.STAGE2_JSONL, max_samples=max_samples, logger=self.logger)
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.config.BATCH_SIZE,
-            shuffle=True,
-            collate_fn=collate_stage2,
-            num_workers=0 if self.device.type == 'cuda' else 2,  # ✅ Match Stage 1 logic
-            pin_memory=True
+        full_dataset = Stage2Dataset(
+            self.config.STAGE2_JSONL, 
+            max_samples=max_samples, 
+            logger=self.logger
         )
         
+        start_epoch = 0
+        if resume:
+            resume_info = self.auto_resume("stage2")
+            if resume_info:
+                start_epoch = resume_info['epoch']
+        
+        # full_dataset = Stage2Dataset(self.config.STAGE2_JSONL, max_samples=max_samples, logger=self.logger)
+        train_size = int((1 - val_split) * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+        # ✅ Create CUDA-compatible generator
+        if self.device.type == 'cuda':
+            generator = torch.Generator(device='cuda').manual_seed(42)
+        else:
+            generator = torch.Generator().manual_seed(42)
+
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            full_dataset, 
+            [train_size, val_size],
+            generator=generator  # ✅ CUDA generator
+        )
+
+        
+        self.logger.info(f"Split: {len(train_dataset)} train, {len(val_dataset)} val")
+        
+        train_loader = DataLoader(
+            train_dataset, batch_size=self.config.BATCH_SIZE, shuffle=False,
+            collate_fn=collate_stage2, num_workers=0, pin_memory=False
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=self.config.BATCH_SIZE, shuffle=False,
+            collate_fn=collate_stage2, num_workers=0, pin_memory=False
+        )
+        
+        early_stopping = EarlyStopping(patience=5, min_delta=0.001)
         self.model.train()
         
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             epoch_loss = 0.0
-            epoch_metrics = {'l_concept': 0.0, 'l_domain': 0.0}
-            
-            pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
             self.optimizer.zero_grad()
             
-            for batch in pbar:
-                # Move to device
-                embeddings = batch['embeddings'].to(self.device)  # [B, L, 1024]
+            for batch_idx, batch in enumerate(pbar):
+                embeddings = batch['embeddings'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
                 
-                # Forward pass
-                with torch.amp.autocast(enabled=self.use_amp):
+                with torch.amp.autocast(device_type='cuda', enabled=self.use_amp):
                     outputs = self.model(embeddings, attention_mask=attention_mask)
-
-                    # ✅ ADD: Compute domain vocabulary alignment loss
-                    domain_vocab = (
-                        self.model.domain_vocab if not isinstance(self.model, nn.DataParallel)
-                        else self.model.module.domain_vocab
+                    
+                    domain_vocab_loss = self.model.domain_vocab.compute_domain_loss(
+                        outputs['compressed_concepts'], batch['domains'], temperature=0.1
                     )
-
-                    domain_vocab_loss = domain_vocab.compute_domain_loss(
-                        outputs['compressed_concepts'],
-                        batch['domains'],
-                        temperature=0.1
-                    )
-
-
-                    # Modify loss_dict computation to include domain vocab loss
+                    
                     loss_dict = self.criterion(
                         outputs,
                         {
@@ -1502,17 +1955,15 @@ class SCMTrainer:
                         },
                         stage='stage2'
                     )
-
-                    # ✅ Add domain vocab loss to total loss
-                    loss = (loss_dict['loss'] + 0.1 * domain_vocab_loss) / self.config.ACCUMULATION_STEPS # 0.1 is weight
+                    
+                    loss = (loss_dict['loss'] + 0.1 * domain_vocab_loss) / self.config.ACCUMULATION_STEPS
                 
                 if self.use_amp:
                     self.scaler.scale(loss).backward()
                 else:
                     loss.backward()
-                    
-                # Backward pass
-                if (self.global_step + 1) % self.config.ACCUMULATION_STEPS == 0:
+                
+                if (batch_idx + 1) % self.config.ACCUMULATION_STEPS == 0:
                     if self.use_amp:
                         self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.GRADIENT_CLIP)
@@ -1521,42 +1972,50 @@ class SCMTrainer:
                     else:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.GRADIENT_CLIP)
                         self.optimizer.step()
-                        
+                    
                     self.optimizer.zero_grad()
-                    self.scheduler.step()
-                
-                # Update metrics
-                epoch_loss += loss.item()
-                for key in epoch_metrics:
-                    if key in loss_dict:
-                        epoch_metrics[key] += loss_dict[key]
-                
-                # Update progress bar
-                pbar.set_postfix({
-                    'loss': loss.item() * self.config.ACCUMULATION_STEPS,
-                    'l_concept': loss_dict['l_concept'],
-                    'lr': self.optimizer.param_groups[0]['lr']
-                })
+                    self.ema.update()
                 
                 self.global_step += 1
+                epoch_loss += loss.item() * self.config.ACCUMULATION_STEPS
+                
+                pbar.set_postfix({'loss': loss.item() * self.config.ACCUMULATION_STEPS})
+                
+                if batch_idx > 0 and batch_idx % 500 == 0:
+                    self.save_checkpoint(
+                        f"stage2_epoch{epoch+1}_batch{batch_idx}.pt",
+                        epoch=epoch, batch_idx=batch_idx, stage="stage2"
+                    )
             
-            # Epoch summary
-            avg_loss = epoch_loss / len(dataloader)
-            self.logger.info(f"Epoch {epoch+1} - Avg Loss: {avg_loss:.4f}")
-            for key, val in epoch_metrics.items():
-                self.logger.info(f"  {key}: {val/len(dataloader):.4f}")
+            # Validate
+            avg_train_loss = epoch_loss / len(train_loader)
+            self.ema.apply_shadow()
+            val_loss = self._validate_epoch(val_loader, stage='stage2')
+            self.ema.restore()
             
-            # Save checkpoint
-            if avg_loss < self.best_loss:
-                self.best_loss = avg_loss
-                self.save_checkpoint(f"stage2_best_epoch{epoch+1}.pt")
+            self.logger.info(f"Epoch {epoch+1} - Train: {avg_train_loss:.4f}, Val: {val_loss:.4f}")
+            self.main_scheduler.step()
+            
+            self.logger.info("🔧 Reducing learning rate for Stage 2 (long sequences)")
+
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.config.LEARNING_RATE * 0.1  # 3e-5 instead of 3e-4
+
+            self.logger.info(f"Stage 2 LR: {self.optimizer.param_groups[0]['lr']:.2e}")
+            
+            if val_loss < self.best_loss:
+                self.best_loss = val_loss
+                self.save_checkpoint(f"stage2_best.pt", epoch=epoch+1, stage="stage2")
+            
+            if early_stopping(val_loss):
+                self.logger.info(f"⏹️ Early stopping at epoch {epoch+1}")
+                break
         
         self.logger.info("✅ Stage 2 training complete")
+        self.save_checkpoint(f"stage2_final_epoch.pt", stage="stage2")
         
-        # Always save final checkpoint
-        self.save_checkpoint(f"stage2_final_epoch{epoch+1}.pt")
-        
-    def train_stage3_rlaif(self, num_epochs: int = 3, max_samples: Optional[int] = None):
+    def train_stage3(self, num_epochs: int = 120, max_samples: Optional[int] = None, 
+                 resume: bool = True, val_split: float = 0.15):
         """
         Stage 3: RLAIF (Reinforcement Learning from AI Feedback)
         
@@ -1566,38 +2025,68 @@ class SCMTrainer:
         self.logger.info("STAGE 3: RLAIF TRAINING")
         self.logger.info("="*80)
         
-        # Load dataset
-        dataset = Stage3RLAIFDataset(
+        full_dataset = Stage3RLAIFDataset(
             self.config.STAGE3_JSONL, 
-            max_samples=max_samples,
+            max_samples=max_samples, 
             logger=self.logger
         )
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.config.BATCH_SIZE,
-            shuffle=True,
-            collate_fn=collate_stage3,
-            num_workers=0 if self.device.type == 'cuda' else 2,
-            pin_memory=True
+        
+        start_epoch = 0
+        if resume:
+            resume_info = self.auto_resume("stage3")
+            if resume_info:
+                start_epoch = resume_info['epoch']
+        
+        # Load dataset
+        # full_dataset = Stage3RLAIFDataset(
+        #     self.config.STAGE3_JSONL, 
+        #     max_samples=max_samples,
+        #     logger=self.logger
+        # )
+        train_size = int((1 - val_split) * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+        # ✅ Create CUDA-compatible generator
+        if self.device.type == 'cuda':
+            generator = torch.Generator(device='cuda').manual_seed(42)
+        else:
+            generator = torch.Generator().manual_seed(42)
+
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            full_dataset, 
+            [train_size, val_size],
+            generator=generator  # ✅ CUDA generator
         )
+
+        self.logger.info(f"Split: {len(train_dataset)} train, {len(val_dataset)} val")
+        
+        train_loader = DataLoader(
+            train_dataset, batch_size=self.config.BATCH_SIZE, shuffle=False,
+            collate_fn=collate_stage3, num_workers=0, pin_memory=False
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=self.config.BATCH_SIZE, shuffle=False,
+            collate_fn=collate_stage3, num_workers=0, pin_memory=False
+        )
+        
+        early_stopping = EarlyStopping(patience=5, min_delta=0.001)
         
         self.model.train()
         
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             epoch_loss = 0.0
             epoch_reward = 0.0
             
-            pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
             
             self.optimizer.zero_grad()
             
-            for batch in pbar:
+            for batch_idx, batch in enumerate(pbar):
                 embeddings = batch['embeddings'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
                 scores = batch['scores'].to(self.device)  # AI quality scores
                 
                 # Forward pass
-                with torch.amp.autocast(enabled=self.use_amp): # Enable FP16
+                with torch.amp.autocast(device_type=str(self.device), enabled=self.use_amp): # Enable FP16
                     outputs = self.model(embeddings, attention_mask=attention_mask)
                     domain_vocab = (
                         self.model.domain_vocab if not isinstance(self.model, nn.DataParallel)
@@ -1655,7 +2144,7 @@ class SCMTrainer:
                         self.optimizer.step()
                     
                     self.optimizer.zero_grad()
-                    self.scheduler.step()
+                    self.ema.update()
 
                 
                 # Update metrics
@@ -1669,49 +2158,184 @@ class SCMTrainer:
                 })
                 
                 self.global_step += 1
+                
+                if batch_idx > 0 and batch_idx % 500 == 0:
+                    self.save_checkpoint(
+                        f"stage3_epoch{epoch+1}_batch{batch_idx}.pt",
+                        epoch=epoch,
+                        batch_idx=batch_idx,
+                        stage="stage3"
+                    )
             
             # Epoch summary
-            avg_loss = epoch_loss / len(dataloader)
-            avg_reward = epoch_reward / len(dataloader)
-            self.logger.info(f"Epoch {epoch+1} - Loss: {avg_loss:.4f}, Avg Score: {avg_reward:.3f}")
+            avg_train_loss = epoch_loss / len(train_loader)
+            self.ema.apply_shadow()
+            val_loss = self._validate_stage3(val_loader)  # Need to add this method
+            self.ema.restore()
+            
+            self.logger.info(f"Epoch {epoch+1} - Train: {avg_train_loss:.4f}, Val: {val_loss:.4f}")
+            self.main_scheduler.step()
             
             # Save checkpoint
-            if avg_loss < self.best_loss:
-                self.best_loss = avg_loss
-                self.save_checkpoint(f"stage3_best_epoch{epoch+1}.pt")
+            if val_loss < self.best_loss:
+                self.best_loss = val_loss
+                self.save_checkpoint(f"stage3_best.pt", epoch=epoch+1, stage="stage3")
+            
+            if early_stopping(val_loss):
+                self.logger.info(f"⏹️ Early stopping at epoch {epoch+1}")
+                break
         
         self.logger.info("✅ Stage 3 RLAIF training complete")
         
         # Always save final checkpoint
-        self.save_checkpoint(f"stage3_final_epoch{epoch+1}.pt")
+        self.save_checkpoint(f"stage3_final_epoch.pt", stage="stage3")
     
-    def save_checkpoint(self, filename: str):
-        """Save model checkpoint"""
+    # def save_checkpoint(self, filename: str):
+    #     """Save model checkpoint"""
+    #     checkpoint_path = self.config.CHECKPOINT_DIR / filename
+    #     torch.save({
+    #         'model_state_dict': self.model.state_dict(),
+    #         'optimizer_state_dict': self.optimizer.state_dict(),
+    #         'scheduler_state_dict': self.scheduler.state_dict(),
+    #         'global_step': self.global_step,
+    #         'best_loss': self.best_loss,
+    #         'config': self.config,
+    #         'compartment_to_idx': self.criterion.compartment_to_idx,  # ✅ Save mappings
+    #         'hierarchy_to_idx': self.criterion.hierarchy_to_idx
+    #     }, checkpoint_path)
+    #     self.logger.info(f"💾 Checkpoint saved: {checkpoint_path}")
+      
+      
+    def evaluate_test_set(self, test_jsonl: str, stage: str = 'stage1'):
+        """Final evaluation on held-out test set"""
+        self.logger.info("="*80)
+        self.logger.info(f"TEST SET EVALUATION - {stage.upper()}")
+        self.logger.info("="*80)
+        
+        if stage == 'stage1':
+            test_dataset = Stage1Dataset(test_jsonl, logger=self.logger)
+            collate_fn = collate_stage1
+        elif stage == 'stage2':
+            test_dataset = Stage2Dataset(test_jsonl, logger=self.logger)
+            collate_fn = collate_stage2
+        else:
+            test_dataset = Stage3RLAIFDataset(test_jsonl, logger=self.logger)
+            collate_fn = collate_stage3
+        
+        test_loader = DataLoader(
+            test_dataset, batch_size=self.config.BATCH_SIZE,
+            shuffle=False, collate_fn=collate_fn, num_workers=0
+        )
+        
+        # Use EMA weights for final evaluation
+        self.ema.apply_shadow()
+        
+        if stage == 'stage3':
+            test_loss = self._validate_stage3(test_loader)
+        else:
+            test_loss = self._validate_epoch(test_loader, stage=stage)
+        
+        self.ema.restore()
+        
+        test_perplexity = np.exp(test_loss)
+        
+        self.logger.info(f"📊 Test Loss: {test_loss:.4f}")
+        self.logger.info(f"📊 Test Perplexity: {test_perplexity:.2f}")
+        
+        return test_loss, test_perplexity
+  
+    def save_checkpoint(self, filename: str, epoch: int = 0, batch_idx: int = 0, stage: str = "unknown"):
+        """Save model checkpoint with full training state"""
         checkpoint_path = self.config.CHECKPOINT_DIR / filename
         torch.save({
+            # Model state
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
+            'scheduler_state_dict': self.swa_scheduler.state_dict(),
+            
+            # Training progress
             'global_step': self.global_step,
             'best_loss': self.best_loss,
+            'epoch': epoch,
+            'batch_idx': batch_idx,
+            'stage': stage,
+            
+            # Config and mappings
             'config': self.config,
-            'compartment_to_idx': self.criterion.compartment_to_idx,  # ✅ Save mappings
-            'hierarchy_to_idx': self.criterion.hierarchy_to_idx
+            'compartment_to_idx': self.criterion.compartment_to_idx,
+            'hierarchy_to_idx': self.criterion.hierarchy_to_idx,
+            
+            # Metadata
+            'timestamp': datetime.now().isoformat()
         }, checkpoint_path)
-        self.logger.info(f"💾 Checkpoint saved: {checkpoint_path}")
+        self.logger.info(f"💾 Checkpoint saved: {checkpoint_path} (epoch {epoch}, step {self.global_step})")
+
     
-    def load_checkpoint(self, filename: str):
-        """Load model checkpoint"""
-        checkpoint_path = self.config.CHECKPOINT_DIR / filename
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+    # def load_checkpoint(self, filename: str):
+    #     """Load model checkpoint"""
+    #     checkpoint_path = self.config.CHECKPOINT_DIR / filename
+    #     checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
+    #     self.model.load_state_dict(checkpoint['model_state_dict'])
+    #     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    #     self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    #     self.global_step = checkpoint['global_step']
+    #     self.best_loss = checkpoint['best_loss']
+        
+    #     self.logger.info(f"📂 Checkpoint loaded: {checkpoint_path}")
+
+
+    def load_checkpoint(self, filename: str) -> Dict:
+        """Load model checkpoint and return training state"""
+        checkpoint_path = self.config.CHECKPOINT_DIR / filename
+        
+        if not checkpoint_path.exists():
+            self.logger.warning(f"⚠️ Checkpoint not found: {checkpoint_path}")
+            return None
+        
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        
+        # Restore model and optimizer
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.global_step = checkpoint['global_step']
-        self.best_loss = checkpoint['best_loss']
+        self.swa_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # Restore training state
+        self.global_step = checkpoint.get('global_step', 0)
+        self.best_loss = checkpoint.get('best_loss', float('inf'))
         
         self.logger.info(f"📂 Checkpoint loaded: {checkpoint_path}")
+        self.logger.info(f"   Resumed from epoch {checkpoint.get('epoch', 0)}, step {self.global_step}")
+        
+        return {
+            'epoch': checkpoint.get('epoch', 0),
+            'batch_idx': checkpoint.get('batch_idx', 0),
+            'stage': checkpoint.get('stage', 'unknown')
+        }
+    
+    def auto_resume(self, stage: str) -> Optional[Dict]:
+        """
+        Automatically find and load the latest checkpoint for a given stage
+        
+        Returns:
+            Dict with {'epoch', 'batch_idx', 'stage'} if resumed, None otherwise
+        """
+        # Look for checkpoints matching this stage
+        checkpoint_pattern = f"{stage}_*.pt"
+        checkpoints = list(self.config.CHECKPOINT_DIR.glob(checkpoint_pattern))
+        
+        if not checkpoints:
+            self.logger.info(f"No checkpoints found for {stage}, starting fresh")
+            return None
+        
+        # Find latest checkpoint by modification time
+        latest_checkpoint = max(checkpoints, key=lambda p: p.stat().st_mtime)
+        
+        self.logger.info(f"🔄 Resuming from: {latest_checkpoint.name}")
+        resume_info = self.load_checkpoint(latest_checkpoint.name)
+        
+        return resume_info
+
 
 def post_training_clustering(trainer: SCMTrainer, logger: logging.Logger):
     """
@@ -1879,19 +2503,42 @@ def main():
     # Initialize trainer
     trainer = SCMTrainer(config, logger)
     
+    trainer.enable_swa(swa_start_epoch=2)  # Start SWA from epoch 2
+
+    # Then training
+    logger.info("\n🚀 Stage 1: Denoising Pre-training")
+    trainer.train_stage1(num_epochs=3, max_samples=12000)
+    
+    # Calculate total steps across all stages
+    stage1_steps = (12000 / config.BATCH_SIZE) * 3 / config.ACCUMULATION_STEPS
+    stage2_steps = (6000 / config.BATCH_SIZE) * 5 / config.ACCUMULATION_STEPS
+    stage3_steps = (3000 / config.BATCH_SIZE) * 3 / config.ACCUMULATION_STEPS
+
+    total_steps = stage1_steps + stage2_steps + stage3_steps
+    trainer.set_warmup_steps(int(total_steps))
+
+    logger.info(f"Total training steps: {int(total_steps)}, Warmup: {trainer.warmup_steps}")
+
+    if config.RUN_LR_FINDER:  # Add this flag to SCMConfig
+        full_dataset = Stage1Dataset(config.STAGE1_JSONL, max_samples=1000)
+        optimal_lr, lrs, losses = trainer.find_optimal_lr(full_dataset)
+        trainer.config.LEARNING_RATE = optimal_lr
+        logger.info(f"✅ Optimal LR found: {optimal_lr:.2e}")
+
+    
     # Training pipeline
     try:
         # Stage 1: Denoising Pre-training
         logger.info("\n🚀 Stage 1: Denoising Pre-training")
-        trainer.train_stage1(num_epochs=3, max_samples=10000)
+        trainer.train_stage1(num_epochs=3, max_samples=12000)
         
         # Stage 2: Supervised Fine-Tuning
         logger.info("\n🚀 Stage 2: Supervised Fine-Tuning")
-        trainer.train_stage2(num_epochs=5, max_samples=5000)
+        trainer.train_stage2(num_epochs=5, max_samples=6000)
         
         # ✅ Stage 3: RLAIF Training
         logger.info("\n🚀 Stage 3: RLAIF Training")
-        trainer.train_stage3_rlaif(num_epochs=3, max_samples=3000)
+        trainer.train_stage3(num_epochs=3, max_samples=3000)
         
         post_training_clustering(trainer, logger)
         
