@@ -13,6 +13,10 @@ Dataset Compatibility:
 - Stage 1: Diffusion pre-training (stage1_pretrain.jsonl)
 - Stage 2: Supervised fine-tuning (stage2_sft.jsonl)
 - Stage 3: RLAIF optimization (stage3_rlaif.jsonl)
+
+# concept clustering and sonar space only work on linux (colab)
+!pip install fairseq2 --extra-index-url https://fair.pkg.atmeta.com/fairseq2/whl/pt2.9.0/cu128
+!pip install sonar-space
 """
 
 import math
@@ -96,10 +100,17 @@ class SCMConfig:
     # Training Hyperparameters
     BATCH_SIZE = 16  # Training batch size
     LEARNING_RATE = 3e-4  # Initial learning rate
+    
+    # For Stage 2/3, use lower initial LR
+    LEARNING_RATE_STAGE1 = 3e-4  # Stage 1
+    LEARNING_RATE_STAGE2 = 1e-5  # Stage 2 (lower!)
+    LEARNING_RATE_STAGE3 = 5e-6  # Stage 3 (even lower)
+
+    
     WEIGHT_DECAY = 0.01  # L2 regularization
     MAX_EPOCHS = 10  # Maximum training epochs
     WARMUP_STEPS = None  # Learning rate warmup steps
-    GRADIENT_CLIP = 1.0  # Gradient clipping threshold
+    GRADIENT_CLIP = 5.0  # Gradient clipping threshold
     
     # Loss Weights
     ALPHA_CONCEPT = 1.0  # Concept prediction loss weight
@@ -1785,16 +1796,23 @@ class SCMTrainer:
                     if self.use_amp:
                         self.scaler.unscale_(self.optimizer)
                         
-                        # ✅ Log gradient norm BEFORE clipping
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), max_norm=float('inf')
+                        # Check gradient norm
+                        total_norm = torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), float('inf')
                         )
-                        if batch_idx % 100 == 0:
-                            self.logger.debug(f"Grad norm: {grad_norm:.4f}")
                         
+                        # ✅ Skip only if infinite/NaN
+                        if torch.isinf(total_norm) or torch.isnan(total_norm):
+                            self.logger.warning(f"⚠️ Skipping step - grad norm: {total_norm}")
+                            self.optimizer.zero_grad()
+                            self.scaler.update()
+                            continue
+                        
+                        # ✅ Always clip (even if large)
                         torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), self.config.GRADIENT_CLIP
+                            self.model.parameters(), 5.0  # More aggressive clipping
                         )
+                        
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     else:
@@ -1822,7 +1840,7 @@ class SCMTrainer:
                     if self.global_step < self.warmup_steps:
                         warmup_factor = (self.global_step + 1) / self.warmup_steps
                         for param_group in self.optimizer.param_groups:
-                            param_group['lr'] = self.config.LEARNING_RATE * warmup_factor
+                            param_group['lr'] = self.config.LEARNING_RATE_STAGE1 * warmup_factor
                     
                     # ✅ Update EMA
                     self.ema.update()
@@ -1876,7 +1894,7 @@ class SCMTrainer:
 
         self.save_checkpoint(f"stage1_final_epoch.pt", stage="stage1")
         
-    def train_stage2(self, num_epochs: int = 100, max_samples: Optional[int] = None, 
+    def train_stage2(self, num_epochs: int = 40, max_samples: Optional[int] = None, 
             resume: bool = True, val_split: float = 0.15):        
         """
         Stage 2: Supervised Fine-Tuning
@@ -1929,6 +1947,17 @@ class SCMTrainer:
         early_stopping = EarlyStopping(patience=5, min_delta=0.001)
         self.model.train()
         
+        # ✅ Set Stage 2 LR ONCE at start (before training loop)
+        target_lr = 1e-4  # Good starting point for Stage 2
+        self.logger.info(f"🔧 Setting Stage 2 LR: {target_lr:.2e}")
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = target_lr
+        
+        # self.logger.info("🔧 Reducing LR for Stage 2 (long sequences)")
+        # for param_group in self.optimizer.param_groups:
+        #     param_group['lr'] = self.config.LEARNING_RATE_STAGE2 * 0.1  # 3e-5
+        # self.logger.info(f"Stage 2 LR: {self.optimizer.param_groups[0]['lr']:.2e}")
+        
         for epoch in range(start_epoch, num_epochs):
             epoch_loss = 0.0
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
@@ -1962,24 +1991,47 @@ class SCMTrainer:
                     self.scaler.scale(loss).backward()
                 else:
                     loss.backward()
-                
+                    
+                # After loss.backward() (line ~1948):
                 if (batch_idx + 1) % self.config.ACCUMULATION_STEPS == 0:
                     if self.use_amp:
                         self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.GRADIENT_CLIP)
+                        
+                        # ✅ Check gradient norm before clipping
+                        total_norm = torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), float('inf')
+                        )
+                        
+                        if total_norm > 1000.0 or torch.isinf(total_norm) or torch.isnan(total_norm):  # ✅ Skip if gradients explode
+                            self.logger.warning(f"⚠️ Skipping step - grad norm: {total_norm:.2f}")
+                            self.optimizer.zero_grad()  # ✅ Clear gradients
+                            self.scaler.update()
+                            continue
+                    
+                        # Now apply gradient clipping
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.config.GRADIENT_CLIP
+                        )
+                        
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.GRADIENT_CLIP)
+                        # Non-AMP path
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.config.GRADIENT_CLIP
+                        )
                         self.optimizer.step()
                     
                     self.optimizer.zero_grad()
-                    self.ema.update()
                 
+                # Update EMA
+                self.ema.update()
                 self.global_step += 1
+
+                # Update metrics
                 epoch_loss += loss.item() * self.config.ACCUMULATION_STEPS
-                
-                pbar.set_postfix({'loss': loss.item() * self.config.ACCUMULATION_STEPS})
+                pbar.set_postfix(loss=loss.item() * self.config.ACCUMULATION_STEPS)
+
                 
                 if batch_idx > 0 and batch_idx % 500 == 0:
                     self.save_checkpoint(
@@ -1995,14 +2047,7 @@ class SCMTrainer:
             
             self.logger.info(f"Epoch {epoch+1} - Train: {avg_train_loss:.4f}, Val: {val_loss:.4f}")
             self.main_scheduler.step()
-            
-            self.logger.info("🔧 Reducing learning rate for Stage 2 (long sequences)")
-
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = self.config.LEARNING_RATE * 0.1  # 3e-5 instead of 3e-4
-
-            self.logger.info(f"Stage 2 LR: {self.optimizer.param_groups[0]['lr']:.2e}")
-            
+                        
             if val_loss < self.best_loss:
                 self.best_loss = val_loss
                 self.save_checkpoint(f"stage2_best.pt", epoch=epoch+1, stage="stage2")
@@ -2014,7 +2059,7 @@ class SCMTrainer:
         self.logger.info("✅ Stage 2 training complete")
         self.save_checkpoint(f"stage2_final_epoch.pt", stage="stage2")
         
-    def train_stage3(self, num_epochs: int = 120, max_samples: Optional[int] = None, 
+    def train_stage3(self, num_epochs: int = 5, max_samples: Optional[int] = None, 
                  resume: bool = True, val_split: float = 0.15):
         """
         Stage 3: RLAIF (Reinforcement Learning from AI Feedback)
@@ -2071,6 +2116,11 @@ class SCMTrainer:
         early_stopping = EarlyStopping(patience=5, min_delta=0.001)
         
         self.model.train()
+        
+        self.logger.info("🔧 Reducing LR for Stage 3 (long sequences)")
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = self.config.LEARNING_RATE_STAGE3 * 0.1  # 3e-5
+        self.logger.info(f"Stage 3 LR: {self.optimizer.param_groups[0]['lr']:.2e}")
         
         for epoch in range(start_epoch, num_epochs):
             epoch_loss = 0.0
@@ -2144,8 +2194,7 @@ class SCMTrainer:
                         self.optimizer.step()
                     
                     self.optimizer.zero_grad()
-                    self.ema.update()
-
+                self.ema.update()
                 
                 # Update metrics
                 epoch_loss += weighted_loss.item()
@@ -2305,10 +2354,10 @@ class SCMTrainer:
         self.best_loss = checkpoint.get('best_loss', float('inf'))
         
         self.logger.info(f"📂 Checkpoint loaded: {checkpoint_path}")
-        self.logger.info(f"   Resumed from epoch {checkpoint.get('epoch', 0)}, step {self.global_step}")
+        self.logger.info(f"   Resumed from epoch {checkpoint.get('epoch', 50)}, step {self.global_step}")
         
         return {
-            'epoch': checkpoint.get('epoch', 0),
+            'epoch': checkpoint.get('epoch', 50),
             'batch_idx': checkpoint.get('batch_idx', 0),
             'stage': checkpoint.get('stage', 'unknown')
         }
@@ -2437,7 +2486,7 @@ def build_decoder_corpus(trainer: SCMTrainer, logger: logging.Logger):
             device=trainer.device
         )
         logger.info("✅ SONAR encoder loaded")
-    except ImportError:
+    except Exception:
         logger.warning("⚠️ sonar-space not installed.")
         logger.warning("Install with: pip install sonar-space")
         return None
@@ -2507,7 +2556,7 @@ def main():
 
     # Then training
     logger.info("\n🚀 Stage 1: Denoising Pre-training")
-    trainer.train_stage1(num_epochs=3, max_samples=12000)
+    # trainer.train_stage1(num_epochs=50, max_samples=12000)
     
     # Calculate total steps across all stages
     stage1_steps = (12000 / config.BATCH_SIZE) * 3 / config.ACCUMULATION_STEPS
@@ -2529,16 +2578,16 @@ def main():
     # Training pipeline
     try:
         # Stage 1: Denoising Pre-training
-        logger.info("\n🚀 Stage 1: Denoising Pre-training")
-        trainer.train_stage1(num_epochs=3, max_samples=12000)
+        # logger.info("\n🚀 Stage 1: Denoising Pre-training")
+        # trainer.train_stage1(num_epochs=50, max_samples=12000)
         
-        # Stage 2: Supervised Fine-Tuning
-        logger.info("\n🚀 Stage 2: Supervised Fine-Tuning")
-        trainer.train_stage2(num_epochs=5, max_samples=6000)
+        # # Stage 2: Supervised Fine-Tuning
+        # logger.info("\n🚀 Stage 2: Supervised Fine-Tuning")
+        # trainer.train_stage2(num_epochs=40, max_samples=6000)
         
-        # ✅ Stage 3: RLAIF Training
-        logger.info("\n🚀 Stage 3: RLAIF Training")
-        trainer.train_stage3(num_epochs=3, max_samples=3000)
+        # # ✅ Stage 3: RLAIF Training
+        # logger.info("\n🚀 Stage 3: RLAIF Training")
+        # trainer.train_stage3(num_epochs=5, max_samples=3000)
         
         post_training_clustering(trainer, logger)
         
