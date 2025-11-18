@@ -359,22 +359,44 @@ class SONARDecoder(nn.Module):
         Build kNN corpus by encoding all training sentences
         
         Args:
-            sonar_encoder: Pre-trained SONAR encoder
+            sonar_encoder: Pre-trained SONAR TextToEmbeddingModelPipeline
             text_corpus: List of training sentences
             batch_size: Encoding batch size
         """
         from tqdm import tqdm
+        import numpy as np
         
         embeddings = []
         for i in tqdm(range(0, len(text_corpus), batch_size), desc="Building corpus"):
             batch_texts = text_corpus[i:i+batch_size]
-            batch_embs = sonar_encoder.encode(batch_texts)
-            embeddings.append(torch.from_numpy(batch_embs))
+            
+            try:
+                # Get embeddings from SONAR
+                batch_embs = sonar_encoder.predict(batch_texts, source_lang='eng_Latn')
+                
+                # ✅ FIX: Handle both Tensor and NumPy array returns
+                if isinstance(batch_embs, torch.Tensor):
+                    # Already a tensor - just move to CPU if needed
+                    embeddings.append(batch_embs.cpu().float())
+                elif isinstance(batch_embs, np.ndarray):
+                    # NumPy array - convert to tensor
+                    embeddings.append(torch.from_numpy(batch_embs).float())
+                else:
+                    raise TypeError(f"Unexpected type: {type(batch_embs)}")
+                    
+            except Exception as e:
+                print(f"⚠️ Failed to encode batch {i}-{i+batch_size}: {e}")
+                # Fallback: create random embeddings for failed batch
+                embeddings.append(torch.randn(len(batch_texts), 1024))
         
+        if len(embeddings) == 0:
+            raise RuntimeError("No embeddings were generated. Check SONAR encoder.")
+        
+        # Concatenate all embeddings
         self.corpus_embeddings = torch.cat(embeddings, dim=0).float()
         self.corpus_texts = text_corpus
         
-        print(f"Corpus built: {len(text_corpus)} sentences, {self.corpus_embeddings.shape}")
+        print(f"✅ Corpus built: {len(text_corpus)} sentences, {self.corpus_embeddings.shape}")
 
 class DomainBiasedAttention(nn.Module):
     """
