@@ -4,12 +4,56 @@ SCM Model Export Script
 Exports trained SCM model to production-ready formats (.pt, .h5, .pkl)
 """
 
+import subprocess
+import sys
 import torch
 import pickle
 import json
 from pathlib import Path
 import logging
 from scm_main import SCMConfig, SCMTransformer, SONARDecoder
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CONFIGURATION - MODIFY THESE PATHS FOR YOUR SYSTEM
+# ═══════════════════════════════════════════════════════════════════
+
+def setup_cuda():
+    """Ensure PyTorch with CUDA 12.x is installed"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            cuda_version = torch.version.cuda
+            major_version = int(cuda_version.split('.')[0]) if cuda_version else 0
+            if major_version >= 12:
+                print(f"✅ CUDA {cuda_version} detected")
+                print(f"✅ GPU: {torch.cuda.get_device_name(0)}")
+                return True
+    except ImportError:
+        pass
+    
+    # Install PyTorch with CUDA 12.1
+    print("⚠ Installing PyTorch with CUDA 12.8 support...")
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "--upgrade",
+        "torch", 
+        "torchvision", 
+        "torchaudio",
+        "--extra-index-url", "https://download.pytorch.org/whl/cu128"
+    ])
+    
+    import torch
+    assert torch.cuda.is_available(), "❌ CUDA installation failed"
+    print(f"✅ PyTorch {torch._version_} installed with CUDA {torch.version.cuda}")
+    return True
+
+# Run setup
+setup_cuda()
+
+# Force CUDA as default device
+torch.set_default_device('cuda')
+# print(f"Default device: {torch.get_default_device()}")
+
 
 def export_scm_model(
     checkpoint_path: str,
@@ -33,7 +77,7 @@ def export_scm_model(
     model = SCMTransformer(config).to('cuda')
     
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location='cuda')
+    checkpoint = torch.load(checkpoint_path, map_location='cuda', weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
@@ -93,13 +137,13 @@ def export_scm_model(
     
     logger.info(f"✅ Exported domain vocabulary: {vocab_path}")
     
-    # ========== EXPORT DECODER CORPUS (if exists) ==========
-    decoder_checkpoint = Path(checkpoint_path).parent / "sonar_decoder.pt"
-    if decoder_checkpoint.exists():
-        decoder_data = torch.load(decoder_checkpoint)
-        decoder_export = export_dir / "sonar_decoder.pt"
-        torch.save(decoder_data, decoder_export)
-        logger.info(f"✅ Exported decoder corpus: {decoder_export}")
+    # # ========== EXPORT DECODER CORPUS (if exists) ==========
+    # decoder_checkpoint = Path(checkpoint_path).parent / "sonar_decoder.pt"
+    # if decoder_checkpoint.exists():
+    #     decoder_data = torch.load(decoder_checkpoint, weights_only=False)
+    #     decoder_export = export_dir / "sonar_decoder.pt"
+    #     torch.save(decoder_data, decoder_export)
+    #     logger.info(f"✅ Exported decoder corpus: {decoder_export}")
     
     logger.info(f"\n🎉 Model export complete! Files saved to {export_dir}")
     

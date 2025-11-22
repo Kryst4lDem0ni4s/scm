@@ -2600,16 +2600,16 @@ def main():
     # Training pipeline
     try:
         # Stage 1: Denoising Pre-training
-        # logger.info("\n🚀 Stage 1: Denoising Pre-training")
-        # trainer.train_stage1(num_epochs=50, max_samples=12000)
+        logger.info("\n🚀 Stage 1: Denoising Pre-training")
+        trainer.train_stage1(num_epochs=50, max_samples=12000)
         
         # # Stage 2: Supervised Fine-Tuning
-        # logger.info("\n🚀 Stage 2: Supervised Fine-Tuning")
-        # trainer.train_stage2(num_epochs=40, max_samples=6000)
+        logger.info("\n🚀 Stage 2: Supervised Fine-Tuning")
+        trainer.train_stage2(num_epochs=40, max_samples=6000)
         
-        # # ✅ Stage 3: RLAIF Training
-        # logger.info("\n🚀 Stage 3: RLAIF Training")
-        # trainer.train_stage3(num_epochs=5, max_samples=3000)
+        # ✅ Stage 3: RLAIF Training
+        logger.info("\n🚀 Stage 3: RLAIF Training")
+        trainer.train_stage3(num_epochs=5, max_samples=3000)
         
         post_training_clustering(trainer, logger)
         
