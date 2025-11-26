@@ -1,5 +1,7 @@
 
+import platform
 import time
+import traceback
 from typing import Any, Dict, List, Optional
 import requests
 import re
@@ -22,7 +24,7 @@ from nltk.tokenize import sent_tokenize
 MAX_TEXT_LENGTH = 10000  # Max chars per document to process
 MIN_SENTENCE_LENGTH = 30  # Min chars for valid sentence
 MAX_DOCS_TO_PROCESS = 15000  # Total documents to extract
-STAGE1_CHECKPOINT_INTERVAL = 30  # Docs per checkpoint
+STAGE1_CHECKPOINT_INTERVAL = 100  # Docs per checkpoint
 STAGE2_CHECKPOINT_INTERVAL = 500
 STAGE3_CHECKPOINT_INTERVAL = 10
 STAGE3_BATCH_SIZE = 10
@@ -45,7 +47,34 @@ STAGE3_REQUESTS_PER_SEC = 2  # Ollama rate limit (adjust based on your setup)
 VALID_COMPARTMENTS = {'FACTUAL', 'PROCEDURAL', 'EPISODIC', 'CONTEXTUAL', 'CONCEPTUAL'}
 VALID_HIERARCHIES = {'GRANULAR', 'INTERMEDIATE', 'GENERAL'}
 
+WIN_PATH = "G:/My Drive/scm_project"
+WSL_PATH = "/mnt/g/My Drive/scm_project"
+
+# Detect running in WSL or Linux
+def in_wsl():
+    if platform.system().lower() == "linux" or "unix" or "wsl":
+        try:
+            with open("/proc/version", "r") as f:
+                return "microsoft" in f.read().lower()
+        except FileNotFoundError:
+            return False
+    return False
+
+if in_wsl():
+    BASE_PATH = WSL_PATH
+else:
+    BASE_PATH = WIN_PATH
+
+CACHE_PATH = os.path.join(BASE_PATH, "cache/datasets")
+OUTPUT_PATH = os.path.join(BASE_PATH, "datasets/processed")
+CHECKPOINT_DIR = os.path.join(BASE_PATH, "checkpoints")
+
+print(f"Using BASE_PATH: {BASE_PATH}")
+print(f"Using CHECKPOINT_DIR: {CHECKPOINT_DIR}")    
+
+LOG_DIR = os.path.join(BASE_PATH, "logs")
 LOG_DIR = "G:/My Drive/scm_project/logs"
+
 os.makedirs(LOG_DIR, exist_ok=True)
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -68,7 +97,10 @@ logger.info(f"Architecture: Small Concept Model (SCM)")
 logger.info(f"Max docs to process: {MAX_DOCS_TO_PROCESS}")
 logger.info("="*80)
 
-NLTK_CACHE = 'G:/My Drive/scm_project/cache/nltk'
+logger.info(f"BASE PATH = {BASE_PATH}")
+
+NLTK_CACHE = os.path.join(BASE_PATH, "cache/nltk")
+
 os.makedirs(NLTK_CACHE, exist_ok=True)
 
 logger.info("Setting up NLTK...")
@@ -88,10 +120,22 @@ try:
 except Exception as e:
     logger.warning(f"punkt_tab download failed (may not be critical): {e}")
 
-BASE_PATH = "G:/My Drive/scm_project"
-CACHE_PATH = os.path.join(BASE_PATH, "cache/datasets")
-OUTPUT_PATH = os.path.join(BASE_PATH, "datasets/processed")
-CHECKPOINT_DIR = os.path.join(BASE_PATH, "checkpoints")
+# BASE_PATH = "G:/My Drive/scm_project"
+# WSL_BASE_PATH = "/mnt/g/My Drive/scm_project"
+# CACHE_PATH = os.path.join(BASE_PATH, "cache/datasets")
+# OUTPUT_PATH = os.path.join(BASE_PATH, "datasets/processed")
+# CHECKPOINT_DIR = os.path.join(BASE_PATH, "checkpoints")
+# WSL_CACHE_PATH = os.path.join(WSL_BASE_PATH, "cache/datasets")
+# WSL_OUTPUT_PATH = os.path.join(WSL_BASE_PATH, "datasets/processed")
+# WSL_CHECKPOINT_DIR = os.path.join(WSL_BASE_PATH, "checkpoints")
+
+# if not os.path.isdir(BASE_PATH):
+#     BASE_PATH = WSL_BASE_PATH
+#     CACHE_PATH = WSL_CACHE_PATH
+#     OUTPUT_PATH = WSL_OUTPUT_PATH
+#     CHECKPOINT_DIR = WSL_CHECKPOINT_DIR
+    
+stage2_file = os.path.join(OUTPUT_PATH, "stage2_sft.jsonl")
 
 os.makedirs(CACHE_PATH, exist_ok=True)
 os.makedirs(OUTPUT_PATH, exist_ok=True)
@@ -214,7 +258,7 @@ def load_checkpoint(checkpoint_name):
     """Load checkpoint with corruption detection."""
     checkpoint_path = os.path.join(CHECKPOINT_DIR, f"{checkpoint_name}.pkl")
     if not os.path.exists(checkpoint_path):
-        logger.info(f"No checkpoint found: {checkpoint_name}")
+        logger.info(f"No checkpoint found: {checkpoint_name}, on {CHECKPOINT_DIR}")
         return None
     
     try:
@@ -248,57 +292,74 @@ logger.info("="*80)
 logger.info("LOADING EMBEDDING MODEL (SCM REQUIREMENT: 1024-DIM SONAR)")
 logger.info("="*80)
 
-class PaddedSONAREncoder:
-    """
-    Wrapper for SentenceTransformer that pads embeddings to 1024-dim.
+class SONAREncoderWrapper:
+    """Unified wrapper supporting both real SONAR and fallback encoders."""
     
-    SCM Architecture requires 1024-dim SONAR embeddings. This pads 768-dim
-    embeddings from paraphrase-multilingual-mpnet-base-v2 to 1024-dim.
-    
-    NOTE: For production, use actual SONAR encoder.
-    """
     def __init__(self):
-        logger.info("Loading base SentenceTransformer (768-dim)...")
-        self.base = SentenceTransformer('sentence-transformers/paraphrase-multilingual-mpnet-base-v2')
-        logger.info("✓ Base model loaded (768-dim)")
-        logger.warning("⚠ Using padded 768→1024 embeddings (suboptimal for production)")
-        logger.warning("⚠ For best results, install SONAR: pip install sonar-embedding")
+        self.encoder_type = None
+        
+        # Try actual SONAR (requires: pip install sonar-space)
+        try:
+            from sonar.inference_pipelines import TextToEmbeddingModelPipeline
+            self.encoder = TextToEmbeddingModelPipeline(
+                encoder="text_sonar_basic_encoder",
+                tokenizer="text_sonar_basic_encoder"
+            )
+            self.encoder_type = "sonar"
+            logger.info("SONAR encoder loaded (1024-dim)")
+        except (ImportError, Exception) as e:
+            logger.warning(f"SONAR unavailable: {e}")
+            
+            # Priority 2: Try LaBSE (native 1024-dim, no padding)
+            try:
+                from sentence_transformers import SentenceTransformer
+                self.encoder = SentenceTransformer('sentence-transformers/LaBSE')
+                self.encoder_type = "labse"
+                logger.info("✓ LaBSE encoder loaded (768-dim, will pad to 1024)")
+            except Exception as e2:
+                logger.warning(f"LaBSE unavailable: {e2}")
+                
+                # Priority 3: Fallback to padded encoder
+                self.encoder = SentenceTransformer('sentence-transformers/paraphrase-multilingual-mpnet-base-v2')
+                self.encoder_type = "padded"
+                logger.warning("⚠ Using padded (768→1024) embeddings (suboptimal)")
     
     def encode(self, text):
-        """Encode text and pad to 1024-dim."""
-        emb_768 = self.base.encode(text)
-        emb_1024 = np.pad(emb_768, (0, 256), mode='constant', constant_values=0)
-        return emb_1024
+        """Unified encoding interface."""
+        if self.encoder_type == "sonar":
+            # SONAR returns 1024-dim directly
+            return self.encoder.predict([text], source_lang="eng_Latn")[0]
+        
+        elif self.encoder_type == "labse":
+            # LaBSE is 768-dim, pad to 1024
+            emb_768 = self.encoder.encode(text)
+            return np.pad(emb_768, (0, 256), mode='constant', constant_values=0)
+        
+        else:  # padded
+            emb_768 = self.encoder.encode(text)
+            return np.pad(emb_768, (0, 256), mode='constant', constant_values=0)
 
+# Initialize encoder
 try:
-    # Try to use actual SONAR if available
-    try:
-        from sonar.inference_pipelines import TextToEmbeddingModelPipeline
-        sonar_encoder = TextToEmbeddingModelPipeline(
-            encoder="text_sonar_basic_encoder",
-            tokenizer="text_sonar_basic_encoder"
-        )
-        logger.info("✓ Actual SONAR encoder loaded (1024-dim)")
-    except ImportError:
-        # Fallback to padded encoder
-        sonar_encoder = PaddedSONAREncoder()
+    sonar_encoder = SONAREncoderWrapper()
     
-    # FIX #6: IMMEDIATE dimension validation (before dataset loading)
+    # Validate dimension
     logger.info("Validating embedding dimension...")
     test_embedding = sonar_encoder.encode("Test sentence for SCM")
     embedding_dim = len(test_embedding) if hasattr(test_embedding, '__len__') else test_embedding.shape[0]
     
     if embedding_dim != 1024:
-        logger.error(f"✗ CRITICAL: Embedding dimension is {embedding_dim}, expected 1024")
+        logger.error(f"CRITICAL: Embedding dimension is {embedding_dim}, expected 1024")
         raise ValueError(f"SCM requires 1024-dim embeddings, got {embedding_dim}")
     
     logger.info(f"✓ Embedding model validated (1024-dim)")
-    logger.info("✓ Embedding model ready (SCM compliant)")
+    logger.info(f"✓ Embedding model ready (SCM compliant)")
     
 except Exception as e:
-    logger.error(f"✗ Failed to load embedding model: {e}")
+    logger.error(f"Failed to load embedding model: {e}")
     logger.error("CRITICAL: Cannot proceed without 1024-dim embedding model")
     raise RuntimeError("Embedding model required but failed to load")
+
 
 SCIENCE_KEYWORDS = [
     # Domain/Source matches
@@ -389,9 +450,10 @@ def estimate_compartment_advanced(text):
     2. Priority mechanism (Procedural/Episodic > others)
     3. Smart fallback (indicator-based, not length-based)
     """
+    text_lower = text.lower()
     
     discard_terms = [
-        'hmm', 'i think', 'i\'m not sure', 'follow us',
+        'follow us',
         'advertisement', 'sponsored', 'buy now', 'download here',
         'sign up', 'register now', 'terms and conditions', 'privacy policy',
         'all rights reserved', 'unsubscribe',
@@ -402,24 +464,30 @@ def estimate_compartment_advanced(text):
     if any(term in text_lower for term in discard_terms):
         return None  # Signal to discard this sentence
     
-    text_lower = text.lower()
+    conceptual_strong = ['hmm', 'therefore', 'concept', 'could be', 'theory', 'implies', 'suggests', "let me", "think", "I know", "I'm", "wonder", "feel", "seem", "should", "concept", "break it down", "right?", "I will", "I can", "I need", "I should", "need to", "think about", "look at", "my reasoning"]
+    if any(kw in text_lower for kw in conceptual_strong):
+        return 'CONCEPTUAL'
+    
+    contextual_strong = ['example', 'because', "occur", "mean", "by the way", "information", "context", "known that", "seen", "also "]
+    if any(kw in text_lower for kw in contextual_strong):
+        return 'CONTEXTUAL'
     
     # Check for procedural keywords first (highest priority)
-    procedural_strong = ['algorithm', 'calculate', 'solve', 'implement', 'derive', 'compute', 'procedur', 'step', 'first', 'then', 'calculate', 'solve', 'process', "what", "next", "via", "how", "data", "start", "end", "last", "procedure", "learn", "calculate", "interpret", "explain", "leads"]
+    procedural_strong = ['procedur', 'step', 'first', "next", "via", "data", "start", "end", "last", "procedure", "leads"]
     if any(kw in text_lower for kw in procedural_strong):
         return 'PROCEDURAL'
     
     # Check for episodic keywords
-    episodic_strong = ['discovered', 'developed by', 'published', 'introduced in', 'discover', 'develop', 'introduced', 'published', 'historical', "remember" "why", "try", "know", "recall", "used to", "said", "happened", "occurred", "consider", "background", "figure out", "has to", "seen"]
+    episodic_strong = ['discovered', 'developed by', 'published', 'introduced in', 'discover', 'develop', 'introduced', 'published', 'historical', "remember" "why", "try", "know", "recall", "used to", "said", "happened", "occurred", "consider", "background", "figure out", "has to", "seen", "I know", "I was", "I did"]
     if any(kw in text_lower for kw in episodic_strong):
         return 'EPISODIC'
-    
+        
     # Score-based fallback
     factual_indicators = ['defined as', 'equals', "=", "/", "sqrt", "{", "(", "%", "\\", "+", "(g)", "element", "chemical", "ion", "molecule", "bond", "mixture", 'known as', 'theorem', 'law', 'formula', 'equation', "compound", "solution", "area", "density", "volume", "weight", "litre", "kg", "nano", "gram", "°", "degree", "^", "$", "MHz", "known as", "volt", "watt", "term is", "answer is"]
-    procedural_indicators = ['step', 'first', 'then', 'calculate', 'solve', 'process', "what", "next", "via", "how", "data", "start", "end", "last", "procedure", "learn", "calculate", "interpret", "explain", "leads", 'but why', 'but it', 'but,', 'but ']
-    episodic_indicators = ['discovered', 'developed by', 'introduced', 'published', 'historical', "remember" "why", "try", "know", "recall", "used to", "said", "happened", "occurred", "consider", "background", "figure out", "has to", "seen"]
-    contextual_indicators = ['but why', 'but it', 'but,', 'but ', 'important', 'application', 'example', 'advantage', 'because', "can be", "idea", "occur", "mean", "by the way", "information", "context", "what are", "known that"]
-    conceptual_indicators = ['but why', 'but it', 'but,', 'but ', 'therefore', 'concept', 'theory', 'implies', 'suggests', "let me", "think", "I know", "I'm", "wonder", "feel", "seem", "should", "concept", "fortunately", "okay", "break it down", "right?", "I was", "I did", "I will", "I know", "I can", "I need", "I should", "I am", "myself", "need to", "think about", "look at", "my reasoning", "I could", "In my", "I've", "okay, so"]
+    procedural_indicators = ['step', 'first', 'then', 'calculate', 'solve', 'process', "what", "next", "via", "how", "data", "start", "end", "last", "procedure", "learn", "calculate", "interpret", "explain", "leads", 'but why', 'but it', 'but,']
+    episodic_indicators = ['discovered', 'developed by', 'introduced', 'published', 'historical', "remember" "why", "try", "know", "recall", "used to", "said", "happened", "occurred", "consider", "background", "figure out", "has to", "seen", 'found that', 'observed in', 'originated', 'pioneered', 'established', 'founded', 'year', 'century', 'era', 'period', 'epoch', 'when was', 'who discovered', 'first observed', 'initially', 'originally']
+    contextual_indicators = ['but why', 'but it', 'but,', 'important', 'application', 'example', 'advantage', 'because', "can be", "idea", "occur", "mean", "by the way", "information", "context", "what are", "known that"]
+    conceptual_indicators = ['but why', 'but it', 'but,', 'therefore', 'concept', 'theory', 'implies', 'suggests', "let me", "think", "I know", "I'm", "wonder", "feel", "seem", "should", "concept", "fortunately", "okay", "break it down", "right?", "I was", "I did", "I will", "I know", "I can", "I need", "I should", "I am", "myself", "need to", "think about", "look at", "my reasoning", "I could", "In my", "I've", "okay, so"]
     
     scores = {
         'FACTUAL': sum(1 for p in factual_indicators if p in text_lower),
@@ -442,15 +510,17 @@ def estimate_compartment_advanced(text):
         has_first_person = any(marker in text_lower for marker in ["i think", "i know", "let me", "i need"])
         
         # Smart fallback logic
-        if has_formula or (has_numbers and len(text) < 150):
-            return 'FACTUAL'
-        elif has_first_person or "think" in text_lower or "reasoning" in text_lower:
-            return 'CONCEPTUAL'
-        elif has_question:
+        
+        if has_question:
             return 'EPISODIC'
+        elif has_first_person or "think" or "remember" in text_lower:
+            return 'CONCEPTUAL'
+        elif "the" in text_lower:
+            return 'PROCEDURAL'
+        elif (has_formula or has_numbers) and not has_question:
+            return 'FACTUAL'
         else:
-            return random.choice(VALID_COMPARTMENTS)
-    
+            return "CONTEXTUAL"
     return max_comp
 
 def determine_hierarchy(text, compartment):
@@ -597,7 +667,19 @@ def determine_hierarchy(text, compartment):
     # ═══════════════════════════════════════════════════════════════
     # COMPARTMENT-AWARE DECISION LOGIC
     # ═══════════════════════════════════════════════════════════════
+    general_strong = ["should", "remember", "know", "happened", "occurred", "seen", "I know", "I was", "I did", "why", 'example', "try", "recall", "used to", "said", "happen", "consider", "background", "figure out", "has to", "see", "explain", "leads", 'but why', 'but it', 'but,', "figure out", "has to",  'advantage', 'because', "can be", "idea", "occur", "mean", "by the way", "information", "context", "what are", "let me", "think", "I know", "I'm", "wonder", "feel", "seem", "should", "concept", "fortunately", "okay", "break it down", "right?", "I was", "I did", "I will", "I know", "I can", "I need", "I should", "I am", "myself", "need to", "think about", "look at", "my reasoning", "I could", "In my", "I've", "okay, so"]
+    if any(kw in text_lower for kw in general_strong):
+        return 'GENERAL'
     
+    granular_strong = ['defined as', 'equals', "=", "/", "sqrt", "{", "(", "%", "\\", "+", "(g)", "element", "chemical", "ion", "molecule", "bond", "mixture", 'known as', 'theorem', 'law', 'formula', 'equation', "compound", "solution", "area", "density", "volume", "weight", "litre", "kg", "nano", "gram", "°", "degree", "^", "$", "MHz", "known as", "volt", "watt", "term is", "answer is"]
+    if any(kw in text_lower for kw in granular_strong):
+        return 'GRANULAR'
+    
+    intermediate_strong = ['discovered', 'concept', 'theory', 'implies', 'suggests', 'important', 'developed by', 'published', 'introduced in', 'discover', 'develop', 'introduced', 'published', 'historical', 'step', 'first', 'then', 'calculate', 'solve', 'process', "what", "next", "via", "how", "data", "start", "end", "last", "procedure", "learn", "calculate", "interpret", 'discovered', 'developed by', 'introduced', 'published', 'historical', "remember", "why", "try", "know", "recall", "used to", "said", "happened", "occurred", "consider", "background", "seen", 'found that', 'observed in', 'originated', 'pioneered', 'established', 'founded', 'year', 'century', 'era', 'period', 'epoch', 'when was', 'who discovered', 'first observed', 'initially', 'originally']
+    if any(kw in text_lower for kw in intermediate_strong):
+        return 'INTERMEDIATE'
+        
+    # Score-based fallback    
     if compartment == 'FACTUAL':
         # Factual statements: Specificity = granular, generalizations = general
         if granular_score >= 2:
@@ -608,7 +690,7 @@ def determine_hierarchy(text, compartment):
             return 'INTERMEDIATE'
         else:
             # Default for facts: If short and specific → granular, if long → intermediate
-            return 'GRANULAR' if word_count < 15 else 'INTERMEDIATE'
+            return 'INTERMEDIATE'
     
     elif compartment == 'PROCEDURAL':
         # Procedures: Exact steps = granular, process overview = general
@@ -729,6 +811,52 @@ def is_science_content(example):
     
     return False
 
+def compute_quality_score(text, steps=None):
+    """
+    Compute dynamic quality score based on content richness.
+    
+    Factors:
+    - Technical density (presence of domain terms)
+    - Formula/equation presence
+    - Length appropriateness
+    - Step quality (if reasoning chain provided)
+    
+    Returns: float between 0.3 and 1.0
+    """
+    text_lower = text.lower()
+    
+    # Base score
+    score = 0.5
+    
+    # Technical term bonus (max +0.25)
+    tech_terms = extract_technical_terms(text_lower)
+    tech_bonus = min(0.05 * len(tech_terms), 0.25)
+    score += tech_bonus
+    
+    # Formula/equation bonus (+0.15)
+    has_formula = bool(re.search(r'[=+\-*/^]', text))
+    if has_formula:
+        score += 0.15
+    
+    # Length appropriateness (±0.1)
+    word_count = len(text.split())
+    if 15 <= word_count <= 400:
+        score += 0.1
+    elif word_count < 10:
+        score -= 0.1
+    
+    # Step quality bonus (if steps provided, max +0.1)
+    if steps:
+        valid_steps = sum(1 for s in steps if s.get('sonar_embedding') is not None)
+        if valid_steps >= 5:
+            score += 0.1
+        elif valid_steps >= 3:
+            score += 0.05
+    
+    # Clamp to [0.3, 1.0]
+    return round(max(0.3, min(score, 1.0)), 2)
+
+
 logger.info("="*80)
 logger.info("LOADING DATASET")
 logger.info("="*80)
@@ -753,286 +881,293 @@ logger.info("Applying science content filter...")
 science_dataset_stream = dataset.filter(is_science_content)
 logger.info("✓ Science filter applied")
 
-logger.info("="*80)
-logger.info("STAGE 1: PRE-TRAINING DATA GENERATION")
-logger.info("SCM Compliance: 1024-dim embeddings + diffusion noise")
-logger.info("="*80)
+# logger.info("="*80)
+# logger.info("STAGE 1: PRE-TRAINING DATA GENERATION")
+# logger.info("SCM Compliance: 1024-dim embeddings + diffusion noise")
+# logger.info("="*80)
 
-checkpoint_data = load_checkpoint("stage1_processing")
+# checkpoint_data = load_checkpoint("stage1_processing")
 
-if checkpoint_data:
-    doc_data = checkpoint_data.get('doc_data', {})
-    stage1_data = checkpoint_data.get('stage1_data', [])
-    doc_count = checkpoint_data.get('doc_count', 0)
-    science_count = checkpoint_data.get('science_count', 0)
-    last_processed_idx = checkpoint_data.get('last_idx', -1)
+# if checkpoint_data:
+#     doc_data = checkpoint_data.get('doc_data', {})
+#     stage1_data = checkpoint_data.get('stage1_data', [])
+#     doc_count = checkpoint_data.get('doc_count', 0)
+#     science_count = checkpoint_data.get('science_count', 0)
+#     last_processed_idx = checkpoint_data.get('last_idx', -1)
     
-    logger.info(f"✓ Resuming from checkpoint:")
-    logger.info(f"  - Processed docs: {doc_count}")
-    logger.info(f"  - Stage 1 samples: {len(stage1_data)}")
-    logger.info(f"  - Last global index: {last_processed_idx}")
-else:
-    doc_data = {}
-    stage1_data = []
-    doc_count = 0
-    science_count = 0
-    last_processed_idx = -1
-    logger.info("Starting fresh Stage 1 processing...")
+#     logger.info(f"✓ Resuming from checkpoint:")
+#     logger.info(f"  - Processed docs: {doc_count}")
+#     logger.info(f"  - Stage 1 samples: {len(stage1_data)}")
+#     logger.info(f"  - Last global index: {last_processed_idx}")
+# else:
+#     doc_data = {}
+#     stage1_data = []
+#     doc_count = 0
+#     science_count = 0
+#     last_processed_idx = -1
+#     logger.info("Starting fresh Stage 1 processing...")
 
-logger.info(f"Processing up to {MAX_DOCS_TO_PROCESS} science docs...")
-logger.info(f"Checkpoint interval: every {STAGE1_CHECKPOINT_INTERVAL} docs")
+# logger.info(f"Processing up to {MAX_DOCS_TO_PROCESS} science docs...")
+# logger.info(f"Checkpoint interval: every {STAGE1_CHECKPOINT_INTERVAL} docs")
 
-# FIX #1 & #2: Track last written position for incremental append
-last_written_stage1_idx = 0
+# # FIX #1 & #2: Track last written position for incremental append
+# last_written_stage1_idx = 0
 
-# FIX #14: Skip already-processed documents efficiently
-if last_processed_idx >= 0:
-    logger.info(f"Skipping {last_processed_idx + 1} already-processed documents...")
-    science_dataset_stream = science_dataset_stream.skip(last_processed_idx + 1)
-    global_idx = last_processed_idx + 1
-else:
-    global_idx = 0
+# # FIX #14: Skip already-processed documents efficiently
+# if last_processed_idx >= 0:
+#     logger.info(f"Skipping {last_processed_idx + 1} already-processed documents...")
+#     science_dataset_stream = science_dataset_stream.skip(last_processed_idx + 1)
+#     global_idx = last_processed_idx + 1
+# else:
+#     global_idx = 0
 
-docs_processed_this_run = 0
+# docs_processed_this_run = 0
 
-for example in tqdm(science_dataset_stream, desc="Stage 1 Processing", total=MAX_DOCS_TO_PROCESS - global_idx):
-    if doc_count >= MAX_DOCS_TO_PROCESS:
-        logger.info(f"Reached MAX_DOCS_TO_PROCESS limit ({MAX_DOCS_TO_PROCESS}). Stopping.")
-        break
+# for example in tqdm(science_dataset_stream, desc="Stage 1 Processing", total=MAX_DOCS_TO_PROCESS - global_idx):
+#     if doc_count >= MAX_DOCS_TO_PROCESS:
+#         logger.info(f"Reached MAX_DOCS_TO_PROCESS limit ({MAX_DOCS_TO_PROCESS}). Stopping.")
+#         break
     
-    full_text = extract_text_from_conversations(example)
-    if not full_text or len(full_text) < 20:
-        logger.debug(f"Doc {global_idx}: Skipped (text too short)")
-        global_idx += 1
-        continue
+#     full_text = extract_text_from_conversations(example)
+#     if not full_text or len(full_text) < 20:
+#         logger.debug(f"Doc {global_idx}: Skipped (text too short)")
+#         global_idx += 1
+#         continue
     
-    query = ""
-    conversations = example.get('conversations', [])
-    for conv in conversations:
-        if 'user' in str(conv.get('from', '')).lower():
-            query = conv.get('value', '')
-            break
+#     query = ""
+#     conversations = example.get('conversations', [])
+#     for conv in conversations:
+#         if 'user' in str(conv.get('from', '')).lower():
+#             query = conv.get('value', '')
+#             break
     
-    sentences = sent_tokenize(full_text[:MAX_TEXT_LENGTH])
-    segments = []
+#     sentences = sent_tokenize(full_text[:MAX_TEXT_LENGTH])
+#     segments = []
     
-    for i, sent in enumerate(sentences):
-        if len(sent.strip()) < MIN_SENTENCE_LENGTH:
-            continue
+#     for i, sent in enumerate(sentences):
+#         if len(sent.strip()) < MIN_SENTENCE_LENGTH:
+#             continue
         
-        comp = estimate_compartment_advanced(sent)
-        hier = determine_hierarchy(sent, comp)  # ✅ Pass compartment
+#         comp = estimate_compartment_advanced(sent)
+#         hier = determine_hierarchy(sent, comp)  # ✅ Pass compartment
         
-        # ✅ Generate embedding HERE (before appending to segments)
-        try:
-            segment_embedding = sonar_encoder.encode(sent.strip())
-            if isinstance(segment_embedding, np.ndarray):
-                segment_embedding = segment_embedding.tolist()
-            elif hasattr(segment_embedding, 'tolist'):
-                segment_embedding = segment_embedding.tolist()
-            elif hasattr(segment_embedding, 'cpu'):  # PyTorch tensor
-                segment_embedding = segment_embedding.cpu().numpy().tolist()
-            elif hasattr(segment_embedding, 'numpy'):  # TF tensor
-                segment_embedding = segment_embedding.numpy().tolist()
-            else:
-                # Last resort: convert to numpy first
-                segment_embedding = np.array(segment_embedding).tolist()
+#         # ✅ Generate embedding HERE (before appending to segments)
+#         try:
+#             segment_embedding = sonar_encoder.encode(sent.strip())
+#             if isinstance(segment_embedding, np.ndarray):
+#                 segment_embedding = segment_embedding.tolist()
+#             elif hasattr(segment_embedding, 'tolist'):
+#                 segment_embedding = segment_embedding.tolist()
+#             elif hasattr(segment_embedding, 'cpu'):  # PyTorch tensor
+#                 segment_embedding = segment_embedding.cpu().numpy().tolist()
+#             elif hasattr(segment_embedding, 'numpy'):  # TF tensor
+#                 segment_embedding = segment_embedding.numpy().tolist()
+#             else:
+#                 # Last resort: convert to numpy first
+#                 segment_embedding = np.array(segment_embedding).tolist()
                 
-            if not isinstance(segment_embedding, list):
-                raise TypeError(f"Embedding is {type(segment_embedding)}, expected list")
+#             if not isinstance(segment_embedding, list):
+#                 raise TypeError(f"Embedding is {type(segment_embedding)}, expected list")
             
-        except Exception as e:
-            logger.warning(f"Doc {global_idx}, Seg {i}: Embedding failed - {e}")
-            logger.warning(f"Embedding logic failed! Pause pipeline and fix.")
-            continue  # Skip segment if embedding fails
+#         except Exception as e:
+#             logger.warning(f"Doc {global_idx}, Seg {i}: Embedding failed - {e}")
+#             logger.warning(f"Embedding logic failed! Pause pipeline and fix.")
+#             continue  # Skip segment if embedding fails
         
-        if len(segment_embedding) != 1024:
-            logger.error(f"Doc {global_idx}, Seg {i}: Embedding dimension is {len(segment_embedding)}, expected 1024")
-            logger.error("CRITICAL: SCM compliance violated! Pausing pipeline.")
-            raise ValueError(f"Embedding dimension mismatch: {len(segment_embedding)} vs 1024")
+#         if len(segment_embedding) != 1024:
+#             logger.error(f"Doc {global_idx}, Seg {i}: Embedding dimension is {len(segment_embedding)}, expected 1024")
+#             logger.error("CRITICAL: SCM compliance violated! Pausing pipeline.")
+#             raise ValueError(f"Embedding dimension mismatch: {len(segment_embedding)} vs 1024")
 
         
-        segments.append({
-            'text': sent.strip(),
-            'compartment': comp,
-            'hierarchy': hier,
-            'position': i,
-            'sonar_embedding': segment_embedding  # ✅ Store embedding
-        })
+#         segments.append({
+#             'text': sent.strip(),
+#             'compartment': comp,
+#             'hierarchy': hier,
+#             'position': i,
+#             'sonar_embedding': segment_embedding  # ✅ Store embedding
+#         })
     
-    if segments:
-        # Sample first doc in detail
-        if doc_count == 0:
-            logger.info(f"\n{'='*60}")
-            logger.info(f"SAMPLE DOCUMENT (Doc {global_idx})")
-            logger.info(f"{'='*60}")
-            logger.info(f"Query: {query[:200]}...")
-            logger.info(f"Text length: {len(full_text)} chars")
-            logger.info(f"Segments: {len(segments)}")
-            logger.info(f"Domain: {example.get('domain', 'N/A')}")
-            logger.info(f"\nFirst 3 segments:")
-            for seg in segments[:3]:
-                imp_score = compute_importance_score(seg['text'])
-                prec = get_precision_requirement(seg['compartment'], seg['hierarchy'])
-                logger.info(f"  [{seg['compartment']}] [{seg['hierarchy']}] [imp:{imp_score}] [prec:{prec}]")
-                logger.info(f"    Text: {seg['text'][:100]}...")
-            logger.info(f"{'='*60}\n")
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"--- DOC {global_idx} ---")
-            logger.debug(f"  Domain: {example.get('domain', 'N/A')}")
-            logger.debug(f"  Source: {example.get('source', 'N/A')}")
-            logger.debug(f"  Difficulty: {example.get('difficulty', 0)}")
-            logger.debug(f"  Segments: {len(segments)}")
-            logger.debug(f"  Query: {query[:100]}")
-            for i, seg in enumerate(segments[:5]):
-                logger.debug(f"    Seg {i}: [{seg['compartment']}] [{seg['hierarchy']}] {seg['text'][:50]}...")
+#     if segments:
+#         # Sample first doc in detail
+#         if doc_count == 0:
+#             logger.info(f"\n{'='*60}")
+#             logger.info(f"SAMPLE DOCUMENT (Doc {global_idx})")
+#             logger.info(f"{'='*60}")
+#             logger.info(f"Query: {query[:200]}...")
+#             logger.info(f"Text length: {len(full_text)} chars")
+#             logger.info(f"Segments: {len(segments)}")
+#             logger.info(f"Domain: {example.get('domain', 'N/A')}")
+#             logger.info(f"\nFirst 3 segments:")
+#             for seg in segments[:3]:
+#                 imp_score = compute_importance_score(seg['text'])
+#                 prec = get_precision_requirement(seg['compartment'], seg['hierarchy'])
+#                 logger.info(f"  [{seg['compartment']}] [{seg['hierarchy']}] [imp:{imp_score}] [prec:{prec}]")
+#                 logger.info(f"    Text: {seg['text'][:100]}...")
+#             logger.info(f"{'='*60}\n")
+#         if logger.isEnabledFor(logging.DEBUG):
+#             logger.debug(f"--- DOC {global_idx} ---")
+#             logger.debug(f"  Domain: {example.get('domain', 'N/A')}")
+#             logger.debug(f"  Source: {example.get('source', 'N/A')}")
+#             logger.debug(f"  Difficulty: {example.get('difficulty', 0)}")
+#             logger.debug(f"  Segments: {len(segments)}")
+#             logger.debug(f"  Query: {query[:100]}")
+#             for i, seg in enumerate(segments[:5]):
+#                 logger.debug(f"    Seg {i}: [{seg['compartment']}] [{seg['hierarchy']}] {seg['text'][:50]}...")
         
-        doc_data[global_idx] = {
-            'segments': segments,
-            'query': query or full_text[:200],
-            'domain': example.get('domain', 'science'),
-            'source': example.get('source', 'OpenThoughts3'),
-            'difficulty': example.get('difficulty', 0)
-        }
+#         doc_data[global_idx] = {
+#             'segments': segments,
+#             'query': query or full_text[:200],
+#             'domain': example.get('domain', 'science'),
+#             'source': example.get('source', 'OpenThoughts3'),
+#             'difficulty': example.get('difficulty', 0)
+#         }
         
-        segments_added = 0
-        for seg in segments:
-            try:
-                # Generate clean embedding (1024-dim)
-                clean_embedding = seg['sonar_embedding']
+#         segments_added = 0
+#         for seg in segments:
+#             try:
+#                 # Generate clean embedding (1024-dim)
+#                 clean_embedding = seg['sonar_embedding']
                 
-                if not isinstance(clean_embedding, list):
-                    if hasattr(clean_embedding, 'tolist'):
-                        clean_embedding = clean_embedding.tolist()
-                    elif isinstance(clean_embedding, np.ndarray):
-                        clean_embedding = clean_embedding.tolist()
-                    else:
-                        raise TypeError(f"Invalid embedding type: {type(clean_embedding)}")
+#                 if not isinstance(clean_embedding, list):
+#                     if hasattr(clean_embedding, 'tolist'):
+#                         clean_embedding = clean_embedding.tolist()
+#                     elif isinstance(clean_embedding, np.ndarray):
+#                         clean_embedding = clean_embedding.tolist()
+#                     else:
+#                         raise TypeError(f"Invalid embedding type: {type(clean_embedding)}")
                 
-                # Apply diffusion noise
-                noisy_embedding, timestep, alpha_t = apply_diffusion_noise(clean_embedding)
+#                 # Apply diffusion noise
+#                 noisy_embedding, timestep, alpha_t = apply_diffusion_noise(clean_embedding)
                 
-            except Exception as e:
-                logger.warning(f"Doc {global_idx}, Seg {seg['position']}: Embedding failed - {e}")
-                continue
+#             except Exception as e:
+#                 logger.warning(f"Doc {global_idx}, Seg {seg['position']}: Embedding failed - {e}")
+#                 continue
             
-            tech_terms = extract_technical_terms(seg['text'])
-            importance = compute_importance_score(seg['text'])
-            precision = get_precision_requirement(seg['compartment'], seg['hierarchy'])
+#             tech_terms = extract_technical_terms(seg['text'])
+#             importance = compute_importance_score(seg['text'])
+#             precision = get_precision_requirement(seg['compartment'], seg['hierarchy'])
             
-            # FIX #7: Include query and difficulty
-            stage1_sample = {
-                "id": f"pretrain_{global_idx:06d}_{seg['position']}",
-                "text": seg['text'],
-                "clean_embedding": seg['sonar_embedding'],  # ✅ Reuse from segment
-                "noisy_embedding": noisy_embedding,
-                "timestep": timestep,
-                "alpha_t": alpha_t,
-                "compartment": seg['compartment'],
-                "hierarchical_level": seg['hierarchy'].lower(),
-                "query": doc_data[global_idx]['query'],  # FIX #7
-                "metadata": {
-                    "domain": doc_data[global_idx]['domain'],
-                    "source": doc_data[global_idx]['source'],
-                    "difficulty": doc_data[global_idx]['difficulty'],  # FIX #7
-                    "technical_terms": tech_terms,
-                    "precision_required": precision,
-                    "importance_score": importance,
-                    "fragility_score": None
-                },
-                "diffusion_config": {
-                    "noise_schedule": "cosine",
-                    "sigma_min": DIFFUSION_SIGMA_MIN,
-                    "sigma_max": DIFFUSION_SIGMA_MAX,
-                    "t_max": DIFFUSION_T_MAX
-                }
-            }
+#             # FIX #7: Include query and difficulty
+#             stage1_sample = {
+#                 "id": f"pretrain_{global_idx:06d}_{seg['position']}",
+#                 "text": seg['text'],
+#                 "clean_embedding": seg['sonar_embedding'],  # ✅ Reuse from segment
+#                 "noisy_embedding": noisy_embedding,
+#                 "timestep": timestep,
+#                 "alpha_t": alpha_t,
+#                 "compartment": seg['compartment'],
+#                 "hierarchical_level": seg['hierarchy'].lower(),
+#                 "query": doc_data[global_idx]['query'],  # FIX #7
+#                 "metadata": {
+#                     "domain": doc_data[global_idx]['domain'],
+#                     "source": doc_data[global_idx]['source'],
+#                     "difficulty": doc_data[global_idx]['difficulty'],  # FIX #7
+#                     "technical_terms": tech_terms,
+#                     "precision_required": precision,
+#                     "importance_score": importance,
+#                     "fragility_score": None
+#                 },
+#                 "diffusion_config": {
+#                     "noise_schedule": "cosine",
+#                     "sigma_min": DIFFUSION_SIGMA_MIN,
+#                     "sigma_max": DIFFUSION_SIGMA_MAX,
+#                     "t_max": DIFFUSION_T_MAX
+#                 }
+#             }
             
-            stage1_data.append(stage1_sample)
-            segments_added += 1
+#             stage1_data.append(stage1_sample)
+#             segments_added += 1
         
-        logger.debug(f"Doc {global_idx}: Added {segments_added}/{len(segments)} segments")
+#         logger.debug(f"Doc {global_idx}: Added {segments_added}/{len(segments)} segments")
         
-        doc_count += 1
-        docs_processed_this_run += 1
+#         doc_count += 1
+#         docs_processed_this_run += 1
         
-        if doc_count % STAGE1_CHECKPOINT_INTERVAL == 0:
-            logger.info(f"\n--- CHECKPOINT at {doc_count} docs ---")
-            logger.info(f"Total Stage 1 samples: {len(stage1_data)}")
-            logger.info(f"Memory usage: {len(stage1_data) * 1024 * 4 / (1024**2):.2f} MB")
+#         if doc_count % STAGE1_CHECKPOINT_INTERVAL == 0:
+#             logger.info(f"\n--- CHECKPOINT at {doc_count} docs ---")
+#             logger.info(f"Total Stage 1 samples: {len(stage1_data)}")
+#             logger.info(f"Memory usage: {len(stage1_data) * 1024 * 4 / (1024**2):.2f} MB")
             
-            # Lightweight checkpoint (metadata only for speed)
-            checkpoint_meta = {
-                'doc_data': doc_data,
-                'stage1_data': [],
-                'doc_count': doc_count,
-                'science_count': science_count,
-                'last_idx': global_idx,
-                'doc_ids_processed': list(doc_data.keys())
-            }
+#             # Lightweight checkpoint (metadata only for speed)
+#             checkpoint_meta = {
+#                 'doc_data': doc_data,
+#                 'stage1_data': [],
+#                 'doc_count': doc_count,
+#                 'science_count': science_count,
+#                 'last_idx': global_idx,
+#                 'doc_ids_processed': list(doc_data.keys())
+#             }
             
-            save_checkpoint(checkpoint_meta, "stage1_processing")
-            logger.info(f"Saved lightweight checkpoint")
+#             save_checkpoint(checkpoint_meta, "stage1_processing")
+#             logger.info(f"Saved lightweight checkpoint")
             
-            # FIX #1: Proper incremental append (only NEW samples)
-            stage1_file = os.path.join(OUTPUT_PATH, "stage1_pretrain.jsonl")
-            with open(stage1_file, 'a', encoding='utf-8') as f:
-                for item in stage1_data[last_written_stage1_idx:]:
-                    f.write(json.dumps(item, ensure_ascii=False) + '\n')
+#             # FIX #1: Proper incremental append (only NEW samples)
+#             stage1_file = os.path.join(OUTPUT_PATH, "stage1_pretrain.jsonl")
+#             try:
+#                 with open(stage1_file, 'a', encoding='utf-8') as f:
+#                     for item in stage1_data[last_written_stage1_idx:]:
+#                         f.write(json.dumps(item, ensure_ascii=False) + "\n")
+#                 print("successfully appended stage1")
+#             except:
+#                 with open(stage1_file, 'a', encoding='utf-8') as f:
+#                     for item in stage1_data[last_written_stage1_idx:]:
+#                         f.write(json.dumps(item, ensure_ascii=False) + '\n')
+#                 print("successfully appended stage1 in except block")
             
-            # FIX #1: Update tracker
-            written_count = len(stage1_data) - last_written_stage1_idx
-            logger.info(f"Appended {written_count} new samples to Stage 1 JSONL")
+#             # FIX #1: Update tracker
+#             written_count = len(stage1_data) - last_written_stage1_idx
+#             logger.info(f"Appended {written_count} new samples to Stage 1 JSONL")
             
-            stage1_data.clear() # Keep unwritten
-            last_written_stage1_idx = 0  # Reset tracker for next batch
-            gc.collect()
-            logger.info(f"Memory freed (retained {len(stage1_data)} unwritten samples)")
+#             stage1_data.clear() # Keep unwritten
+#             last_written_stage1_idx = 0  # Reset tracker for next batch
+#             gc.collect()
+#             logger.info(f"Memory freed (retained {len(stage1_data)} unwritten samples)")
             
-            logger.info("--- CHECKPOINT COMPLETE ---\n")
+#             logger.info("--- CHECKPOINT COMPLETE ---\n")
     
-    global_idx += 1
+#     global_idx += 1
 
-logger.info(f"\n{'='*80}")
-logger.info(f"STAGE 1 COMPLETE")
-logger.info(f"{'='*80}")
-logger.info(f"Total docs: {doc_count}")
-logger.info(f"Total samples: {len(stage1_data) + last_written_stage1_idx}")
-logger.info(f"Docs with segments: {len(doc_data)}")
+# logger.info(f"\n{'='*80}")
+# logger.info(f"STAGE 1 COMPLETE")
+# logger.info(f"{'='*80}")
+# logger.info(f"Total docs: {doc_count}")
+# logger.info(f"Total samples: {len(stage1_data) + last_written_stage1_idx}")
+# logger.info(f"Docs with segments: {len(doc_data)}")
 
-# FIX #3: Save full doc_data at end (with segments for Stage 2)
-save_checkpoint({
-    'doc_data': doc_data,  # Full data with segments
-    'stage1_data': [],
-    'doc_count': doc_count,
-    'science_count': science_count,
-    'last_idx': global_idx - 1,
-    'doc_ids_processed': list(doc_data.keys())
-}, "stage1_processing")
+# # FIX #3: Save full doc_data at end (with segments for Stage 2)
+# save_checkpoint({
+#     'doc_data': doc_data,  # Full data with segments
+#     'stage1_data': [],
+#     'doc_count': doc_count,
+#     'science_count': science_count,
+#     'last_idx': global_idx - 1,
+#     'doc_ids_processed': list(doc_data.keys())
+# }, "stage1_processing")
 
-# FIX #2: Correct final write logic (append remaining samples)
-stage1_file = os.path.join(OUTPUT_PATH, "stage1_pretrain.jsonl")
+# # FIX #2: Correct final write logic (append remaining samples)
+# stage1_file = os.path.join(OUTPUT_PATH, "stage1_pretrain.jsonl")
 
-if last_written_stage1_idx < len(stage1_data):
-    logger.info(f"Writing final {len(stage1_data) - last_written_stage1_idx} Stage 1 samples...")
-    with open(stage1_file, 'a', encoding='utf-8') as f:
-        for item in stage1_data[last_written_stage1_idx:]:
-            f.write(json.dumps(item, ensure_ascii=False) + '\n')
-    logger.info(f"✓ Final write complete")
-else:
-    logger.info(f"No remaining Stage 1 samples to write")
+# if last_written_stage1_idx < len(stage1_data):
+#     logger.info(f"Writing final {len(stage1_data) - last_written_stage1_idx} Stage 1 samples...")
+#     with open(stage1_file, 'a', encoding='utf-8') as f:
+#         for item in stage1_data[last_written_stage1_idx:]:
+#             f.write(json.dumps(item, ensure_ascii=False) + "\n")
+#     logger.info(f"✓ Final write complete")
+# else:
+#     logger.info(f"No remaining Stage 1 samples to write")
 
-# Count final samples
-if os.path.exists(stage1_file):
-    with open(stage1_file, 'r', encoding='utf-8') as f:
-        final_stage1_count = sum(1 for _ in f)
-    logger.info(f"Stage 1 JSONL total: {final_stage1_count} samples")
+# # Count final samples
+# if os.path.exists(stage1_file):
+#     with open(stage1_file, 'r', encoding='utf-8') as f:
+#         final_stage1_count = sum(1 for _ in f)
+#     logger.info(f"Stage 1 JSONL total: {final_stage1_count} samples")
 
-save_checkpoint({'doc_data': doc_data}, "doc_data_for_stage2")
+# save_checkpoint({'doc_data': doc_data}, "doc_data_for_stage2")
 
-del stage1_data
-gc.collect()
-logger.info("✓ Memory cleared")
+# del stage1_data
+# gc.collect()
+# logger.info("✓ Memory cleared")
 
 
 # ===================================================================
@@ -1043,49 +1178,52 @@ logger.info("="*80)
 logger.info("LOADING doc_data FROM STAGE 1 CHECKPOINT")
 logger.info("="*80)
 
-doc_data = None
+try:
+    doc_data = None
 
-# Try loading from Stage 1 checkpoint
-checkpoint_data = load_checkpoint("stage1_processing")
-if checkpoint_data and 'doc_data' in checkpoint_data:
-    doc_data = checkpoint_data['doc_data']
-    logger.info(f"✓ Loaded doc_data from stage1_processing: {len(doc_data)} documents")
+    # Try loading from Stage 1 checkpoint
+    checkpoint_data = load_checkpoint("stage1_processing")
+    if checkpoint_data and 'doc_data' in checkpoint_data:
+        doc_data = checkpoint_data['doc_data']
+        logger.info(f"✓ Loaded doc_data from stage1_processing: {len(doc_data)} documents")
 
-# Fallback: Try doc_data_for_stage2 checkpoint
-if not doc_data:
-    doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
-    if doc_data_checkpoint and 'doc_data' in doc_data_checkpoint:
-        doc_data = doc_data_checkpoint['doc_data']
-        logger.info(f"✓ Loaded doc_data from doc_data_for_stage2: {len(doc_data)} documents")
+    # Fallback: Try doc_data_for_stage2 checkpoint
+    if not doc_data:
+        doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
+        if doc_data_checkpoint and 'doc_data' in doc_data_checkpoint:
+            doc_data = doc_data_checkpoint['doc_data']
+            logger.info(f"✓ Loaded doc_data from doc_data_for_stage2: {len(doc_data)} documents")
 
-# Validation
-if not doc_data or len(doc_data) == 0:
-    logger.error("✗ No doc_data found! Stage 1 must be completed first.")
-    logger.error("Expected checkpoint: stage1_processing.pkl or doc_data_for_stage2.pkl")
-    raise ValueError("Cannot proceed with Stage 2: No doc_data available")
+    # Validation
+    logger.info(f"Using checkpoint directory: {CHECKPOINT_DIR}")
 
-sample_doc = doc_data[list(doc_data.keys())[0]]
-if 'segments' in sample_doc and len(sample_doc['segments']) > 0:
-    sample_seg = sample_doc['segments'][0]
-    
-    if 'sonar_embedding' not in sample_seg:
-        logger.error("❌ CRITICAL: Checkpoint has old format (missing sonar_embedding)")
-        logger.error("  Loaded doc_data does NOT contain embeddings in segments")
-        logger.error("  You MUST regenerate Stage 1 with fixed code")
-        raise ValueError("Incompatible checkpoint: Missing embeddings in segments")
-    
-    # Check dimension
-    emb_dim = len(sample_seg['sonar_embedding'])
-    if emb_dim != 1024:
-        logger.error(f"❌ CRITICAL: Embeddings are {emb_dim}-dim, expected 1024")
-        raise ValueError(f"SCM compliance violated: {emb_dim}-dim embeddings")
-    
-    logger.info("✅ doc_data validated: Segments contain 1024-dim embeddings")
+    if not doc_data or len(doc_data) == 0:
+        logger.error("✗ No doc_data found! Stage 1 must be completed first.")
+        logger.error("Expected checkpoint: stage1_processing.pkl or doc_data_for_stage2.pkl")
+        raise ValueError("Cannot proceed with Stage 2: No doc_data available")
 
+    sample_doc = doc_data[list(doc_data.keys())[0]]
+    if 'segments' in sample_doc and len(sample_doc['segments']) > 0:
+        sample_seg = sample_doc['segments'][0]
+        
+        if 'sonar_embedding' not in sample_seg:
+            logger.error("❌ CRITICAL: Checkpoint has old format (missing sonar_embedding)")
+            logger.error("  Loaded doc_data does NOT contain embeddings in segments")
+            logger.error("  You MUST regenerate Stage 1 with fixed code")
+            raise ValueError("Incompatible checkpoint: Missing embeddings in segments")
+        
+        # Check dimension
+        emb_dim = len(sample_seg['sonar_embedding'])
+        if emb_dim != 1024:
+            logger.error(f"❌ CRITICAL: Embeddings are {emb_dim}-dim, expected 1024")
+            raise ValueError(f"SCM compliance violated: {emb_dim}-dim embeddings")
+        
+        logger.info("✅ doc_data validated: Segments contain 1024-dim embeddings")
+except:
+    traceback.print_exc()
 
 logger.info(f"✓ doc_data ready for Stage 2: {len(doc_data)} documents")
 logger.info("="*80)
-
 
 logger.info("="*80)
 logger.info("STAGE 2: SUPERVISED FINE-TUNING (CoT CONSTRUCTION)")
@@ -1093,7 +1231,7 @@ logger.info("SCM Compliance: Per-step embeddings + dynamic importance")
 logger.info("="*80)
 
 stage2_file = os.path.join(OUTPUT_PATH, "stage2_sft.jsonl")
-
+    
 # ✅ FIX: Always try to resume from checkpoint, even if file exists
 stage2_checkpoint = load_checkpoint("stage2_progress")
 
@@ -1278,7 +1416,7 @@ if len(processed_doc_ids) < len(doc_data):
                     "hierarchy_distribution": hier_dist,
                     "avg_importance": round(sum(s['importance_score'] for s in steps) / len(steps), 2),
                     "code_validated": False,
-                    "quality_score": 0.85
+                    "quality_score": compute_quality_score(data['query'], steps)
                 }
             }
             
@@ -1323,7 +1461,7 @@ if len(processed_doc_ids) < len(doc_data):
             
             with open(stage2_file, 'a', encoding='utf-8') as f:
                 for item in stage2_data[last_written_idx:]:
-                    f.write(json.dumps(item, ensure_ascii=False) + '\n')
+                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
             
             last_written_idx = len(stage2_data)
             logger.info(f"✓ Appended to JSONL")
@@ -1340,7 +1478,7 @@ if len(processed_doc_ids) < len(doc_data):
         logger.info(f"Writing final samples...")
         with open(stage2_file, 'a', encoding='utf-8') as f:
             for item in stage2_data[last_written_idx:]:
-                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
     
     logger.info(f"\n{'='*80}")
     logger.info(f"STAGE 2 COMPLETE")
@@ -1700,6 +1838,87 @@ def extract_final_answer_from_json(json_response: str) -> str:
     
     return "No final answer provided"
 
+# ═══════════════════════════════════════════════════════════════
+# VOCABULARY TRAINING (Run once on corpus)
+# ═══════════════════════════════════════════════════════════════
+
+def train_domain_vocabulary(output_dir=OUTPUT_PATH, vocab_size=30000):
+    """
+    Train BPE vocabulary on cleaned corpus (optional).
+    Only needed if using SONAR decoder for text generation.
+    """
+    logger.info("="*80)
+    logger.info("OPTIONAL: TRAINING DOMAIN VOCABULARY")
+    logger.info("="*80)
+    
+    try:
+        from tokenizers import Tokenizer, models, trainers, pre_tokenizers
+        
+        # Collect text from all stages
+        corpus_file = Path(output_dir) / "corpus_for_vocab.txt"
+        
+        logger.info(f"Building corpus from generated data...")
+        with open(corpus_file, 'w', encoding='utf-8') as f:
+            # Stage 1
+            if os.path.exists(os.path.join(OUTPUT_PATH, 'stage1_pretrain.jsonl')):
+                with open(os.path.join(OUTPUT_PATH, 'stage1_pretrain.jsonl'), 'r') as s1:
+                    for line in s1:
+                        try:
+                            data = json.loads(line)
+                            f.write(data['text'] + '\n')
+                        except:
+                            continue
+            
+            # Stage 2
+            if os.path.exists(os.path.join(OUTPUT_PATH, 'stage2_sft.jsonl')):
+                with open(os.path.join(OUTPUT_PATH, 'stage2_sft.jsonl'), 'r') as s2:
+                    for line in s2:
+                        try:
+                            data = json.loads(line)
+                            for step in data.get('reasoning_chain', []):
+                                f.write(step['text'] + '\n')
+                        except:
+                            continue
+        
+        logger.info(f"✓ Corpus saved: {corpus_file}")
+        
+        # Train BPE tokenizer
+        logger.info(f"Training BPE vocabulary (size={vocab_size})...")
+        tokenizer = Tokenizer(models.BPE())
+        tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        
+        trainer = trainers.BpeTrainer(
+            vocab_size=vocab_size,
+            special_tokens=["<pad>", "<unk>", "<bos>", "<eos>", "<mask>"],
+            show_progress=True
+        )
+        
+        tokenizer.train(files=[str(corpus_file)], trainer=trainer)
+        
+        vocab_path = Path(output_dir) / "scm_tokenizer.json"
+        tokenizer.save(str(vocab_path))
+        
+        logger.info(f"✓ Vocabulary trained and saved: {vocab_path}")
+        logger.info(f"✓ Vocabulary size: {tokenizer.get_vocab_size()}")
+        
+        return str(vocab_path)
+        
+    except ImportError:
+        logger.warning("tokenizers library not installed. Skipping vocabulary training.")
+        logger.warning("Install with: pip install tokenizers")
+        return None
+    except Exception as e:
+        logger.error(f"Vocabulary training failed: {e}")
+        return None
+
+# Uncomment to enable vocabulary training after pipeline completion
+# if __name__ == "__main__":
+#     # After all stages complete:
+#     vocab_path = train_domain_vocabulary()
+#     if vocab_path:
+#         logger.info(f"Vocabulary ready for SONAR decoder: {vocab_path}")
+
+
 def generate_single_candidate(query, candidate_num=0, model=OLLAMA_MODEL, max_retries=3):
     """
     Generate a single candidate with JSON output format.
@@ -1755,12 +1974,26 @@ OUTPUT SCHEMA:
   "final_answer": "Brief summary of the complete explanation"
 }}
 
+You MUST respond with VALID JSON matching this exact schema:
+{{
+  "segments": [
+    {{
+      "seg_id": 0,
+      "compartment": "FACTUAL|PROCEDURAL|EPISODIC|CONTEXTUAL|CONCEPTUAL",
+      "hierarchy": "GRANULAR|INTERMEDIATE|GENERAL",
+      "text": "your reasoning step here"
+    }}
+  ],
+  "final_answer": "your final answer here"
+}}
+
 REQUIREMENTS:
 - Start seg_id from 0 and increment sequentially
 - Ensure JSON is properly formatted (escaped quotes, valid syntax).
 - Each text field should be detailed and substantive.
 - Mix different compartments and hierarchies logically throughout.
 - Minimum 20 segments required for acceptance.
+- Focus on the query, and reach the answer with all available context.
 
 Generate the JSON-only response now:"""
             

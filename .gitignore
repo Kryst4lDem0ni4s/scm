@@ -1,2 +1,4 @@
 venv/
 .venv/
+.wsl-venv/
+G/

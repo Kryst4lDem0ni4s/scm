@@ -14,7 +14,7 @@ Dataset Compatibility:
 - Stage 2: Supervised fine-tuning (stage2_sft.jsonl)
 - Stage 3: RLAIF optimization (stage3_rlaif.jsonl)
 
-# concept clustering and sonar space only work on linux (colab)
+# concept clustering and sonar space only work on linux (colab) or wsl terminal
 !pip install fairseq2 --extra-index-url https://fair.pkg.atmeta.com/fairseq2/whl/pt2.9.0/cu128
 !pip install sonar-space
 """
@@ -59,8 +59,8 @@ def setup_cuda():
     except ImportError:
         pass
     
-    # Install PyTorch with CUDA 12.1
-    print("⚠ Installing PyTorch with CUDA 12.9 support...")
+    # Install PyTorch with CUDA 12.8
+    print("⚠ Installing PyTorch with CUDA 12.8 support...")
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "--upgrade",
         "torch", 
@@ -104,7 +104,7 @@ class SCMConfig:
     # For Stage 2/3, use lower initial LR
     LEARNING_RATE_STAGE1 = 3e-4  # Stage 1
     LEARNING_RATE_STAGE2 = 1e-5  # Stage 2 (lower!)
-    LEARNING_RATE_STAGE3 = 5e-6  # Stage 3 (even lower)
+    LEARNING_RATE_STAGE3 = 5e-7  # Stage 3 (even lower)
 
     
     WEIGHT_DECAY = 0.01  # L2 regularization
