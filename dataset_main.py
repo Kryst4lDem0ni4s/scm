@@ -727,6 +727,11 @@ def estimate_compartment_advanced(text):
     if any(term in text_lower for term in discard_terms):
         return None  # Signal to discard this sentence
     
+    # Check for episodic keywords
+    episodic_strong = ['discovered', 'developed by', 'published', 'introduced in', 'discover', 'develop', 'introduced', 'published', 'historical', "remember" "why", "try", "know", "recall", "used to", "said", "happened", "occurred", "consider", "background", "figure out", "has to", "seen", "I know", "I was", "I did"]
+    if any(kw in text_lower for kw in episodic_strong):
+        return 'EPISODIC'
+        
     conceptual_strong = ['hmm', 'therefore', 'concept', 'could be', 'theory', 'implies', 'suggests', "let me", "think", "I know", "I'm", "wonder", "feel", "seem", "should", "concept", "break it down", "right?", "I will", "I can", "I need", "I should", "need to", "think about", "look at", "my reasoning"]
     if any(kw in text_lower for kw in conceptual_strong):
         return 'CONCEPTUAL'
@@ -740,11 +745,6 @@ def estimate_compartment_advanced(text):
     if any(kw in text_lower for kw in procedural_strong):
         return 'PROCEDURAL'
     
-    # Check for episodic keywords
-    episodic_strong = ['discovered', 'developed by', 'published', 'introduced in', 'discover', 'develop', 'introduced', 'published', 'historical', "remember" "why", "try", "know", "recall", "used to", "said", "happened", "occurred", "consider", "background", "figure out", "has to", "seen", "I know", "I was", "I did"]
-    if any(kw in text_lower for kw in episodic_strong):
-        return 'EPISODIC'
-        
     # Score-based fallback
     factual_indicators = ['defined as', 'equals', "=", "/", "sqrt", "{", "(", "%", "\\", "+", "(g)", "element", "chemical", "ion", "molecule", "bond", "mixture", 'known as', 'theorem', 'law', 'formula', 'equation', "compound", "solution", "area", "density", "volume", "weight", "litre", "kg", "nano", "gram", "°", "degree", "^", "$", "MHz", "known as", "volt", "watt", "term is", "answer is"]
     procedural_indicators = ['step', 'first', 'then', 'calculate', 'solve', 'process', "what", "next", "via", "how", "data", "start", "end", "last", "procedure", "learn", "calculate", "interpret", "explain", "leads", 'but why', 'but it', 'but,']
