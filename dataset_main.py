@@ -7,7 +7,6 @@ import requests
 import re
 import os
 import json
-import pickle
 import random
 import gc
 import numpy as np
@@ -23,7 +22,7 @@ from nltk.tokenize import sent_tokenize
 
 MAX_TEXT_LENGTH = 10000  # Max chars per document to process
 MIN_SENTENCE_LENGTH = 30  # Min chars for valid sentence
-MAX_DOCS_TO_PROCESS = 15000  # Total documents to extract
+MAX_DOCS_TO_PROCESS = 8000  # Total documents to extract
 STAGE1_CHECKPOINT_INTERVAL = 100  # Docs per checkpoint
 STAGE2_CHECKPOINT_INTERVAL = 500
 STAGE3_CHECKPOINT_INTERVAL = 10
@@ -241,52 +240,316 @@ class RateLimitedExecutor:
     def shutdown(self):
         self.executor.shutdown(wait=True)
 
+import os
+import gc
+import json
+import logging
+from typing import Iterator, List, Dict, Any, Optional
+import pyarrow as pa
+import pyarrow.parquet as pq
+import numpy as np
 
-def save_checkpoint(data, checkpoint_name):
-    """Save checkpoint (FIX #15: No redundant file size logging)."""
-    checkpoint_path = os.path.join(CHECKPOINT_DIR, f"{checkpoint_name}.pkl")
+
+CHECKPOINT_CHUNK_SIZE = 500  # Documents per Parquet chunk file
+
+# ============================================================================
+# HELPER: Convert stage data to Parquet-compatible format
+# ============================================================================
+
+def _prepare_row_for_parquet(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert a single document/sample dict to Parquet-compatible format.
+    Handles nested dicts, lists, and numpy arrays (embeddings).
+    """
+    parquet_row = {}
+    
+    for key, value in row.items():
+        if isinstance(value, np.ndarray):
+            # Convert numpy array to list for Parquet
+            parquet_row[key] = value.tolist()
+        elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], (int, float, np.number)):
+            # Numeric list - keep as is
+            parquet_row[key] = value
+        elif isinstance(value, dict):
+            # Nested dict - serialize to JSON string
+            parquet_row[key] = json.dumps(value)
+        elif value is None:
+            parquet_row[key] = None
+        else:
+            parquet_row[key] = value
+    
+    return parquet_row
+
+
+def _restore_row_from_parquet(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Restore original types from Parquet row.
+    Converts JSON strings back to dicts, lists back to numpy arrays for embeddings.
+    """
+    restored_row = {}
+    
+    for key, value in row.items():
+        if value is None:
+            restored_row[key] = None
+        elif key in ['clean_embedding', 'noisy_embedding', 'sonar_embedding']:
+            # Convert embedding lists back to numpy arrays
+            restored_row[key] = np.array(value, dtype=np.float32) if value else None
+        elif key in ['metadata', 'diffusion_config']:
+            # Deserialize JSON strings back to dicts
+            try:
+                restored_row[key] = json.loads(value) if isinstance(value, str) else value
+            except:
+                restored_row[key] = value
+        else:
+            restored_row[key] = value
+    
+    return restored_row
+
+
+# ============================================================================
+# SAVE CHECKPOINT (CHUNKED PARQUET)
+# ============================================================================
+
+def save_checkpoint(data: Dict[str, Any], checkpoint_name: str) -> bool:
+    """
+    Save checkpoint as chunked Parquet files for efficient low-RAM loading.
+    
+    Args:
+        data: Dict with structure {'doc_data': [...], ...} or {'stage2_data': [...], ...}
+        checkpoint_name: Base name for checkpoint (e.g., 'stage1_processing')
+    
+    Returns:
+        bool: True if successful
+    """
     try:
-        with open(checkpoint_path, 'wb') as f:
-            pickle.dump(data, f)
-        logger.info(f"✓ Checkpoint saved: {checkpoint_name}")
+        # Determine the data key (doc_data for stage1, stage2_data for stage2, etc.)
+        data_key = None
+        for possible_key in ['doc_data', 'stage2_data', 'stage3_data']:
+            if possible_key in data:
+                data_key = possible_key
+                break
+        
+        if not data_key:
+            logger.warning(f"No recognized data key in checkpoint {checkpoint_name}")
+            return False
+        
+        records = data[data_key]
+        was_dict = isinstance(records, dict)
+        if was_dict:
+            logger.info(f"Converting dict {data_key} ({len(records)} items) → list")
+            record_keys = list(records.keys())
+            records = [records[k] for k in record_keys]
+            data[f'{data_key}_keys'] = record_keys  # Save keys for reconstruct
+
+        total_records = len(records)
+        
+        if total_records == 0:
+            logger.warning(f"No records to save in {checkpoint_name}")
+            return False
+        
+        # Save metadata file (non-chunked data like processed_doc_ids, counters, etc.)
+        metadata = {k: v for k, v in data.items() if k != data_key}
+        metadata['total_records'] = total_records
+        metadata['data_key'] = data_key
+        
+        metadata_path = os.path.join(CHECKPOINT_DIR, f"{checkpoint_name}_meta.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f)
+        
+        # Save data in chunks
+        num_chunks = (total_records + CHECKPOINT_CHUNK_SIZE - 1) // CHECKPOINT_CHUNK_SIZE
+        
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * CHECKPOINT_CHUNK_SIZE
+            end_idx = min(start_idx + CHECKPOINT_CHUNK_SIZE, total_records)
+            chunk_records = records[start_idx:end_idx]
+            
+            # Prepare records for Parquet
+            parquet_records = [_prepare_row_for_parquet(rec) for rec in chunk_records]
+            
+            # Convert to PyArrow Table
+            table = pa.Table.from_pylist(parquet_records)
+            
+            # Write Parquet chunk
+            chunk_path = os.path.join(CHECKPOINT_DIR, f"{checkpoint_name}_chunk_{chunk_idx:04d}.parquet")
+            pq.write_table(table, chunk_path, compression='snappy')
+            
+            logger.info(f"✓ Saved chunk {chunk_idx + 1}/{num_chunks} ({len(chunk_records)} records) to {os.path.basename(chunk_path)}")
+        
+        logger.info(f"✓ Checkpoint saved: {checkpoint_name} ({num_chunks} chunks, {total_records} total records)")
         return True
+        
     except Exception as e:
         logger.error(f"✗ Failed to save checkpoint {checkpoint_name}: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
-def load_checkpoint(checkpoint_name):
-    """Load checkpoint with corruption detection."""
-    checkpoint_path = os.path.join(CHECKPOINT_DIR, f"{checkpoint_name}.pkl")
-    if not os.path.exists(checkpoint_path):
-        logger.info(f"No checkpoint found: {checkpoint_name}, on {CHECKPOINT_DIR}")
-        return None
+
+# ============================================================================
+# LOAD CHECKPOINT (STREAMING, CHUNKED)
+# ============================================================================
+
+def load_checkpoint_streaming(checkpoint_name: str, chunk_size: int = 25) -> Iterator[List[Dict]]:
+    """
+    Stream checkpoint data in small batches from chunked Parquet files.
+    NEVER loads entire checkpoint into RAM - yields batches incrementally.
+    
+    Args:
+        checkpoint_name: Base name of checkpoint
+        chunk_size: Number of records to yield per batch (independent of file chunk size)
+    
+    Yields:
+        List[Dict]: Batch of restored records
+    """
+    metadata_path = os.path.join(CHECKPOINT_DIR, f"{checkpoint_name}_meta.json")
+    
+    if not os.path.exists(metadata_path):
+        logger.info(f"No checkpoint found: {checkpoint_name}")
+        return
     
     try:
-        with open(checkpoint_path, 'rb') as f:
-            data = pickle.load(f)
-        logger.info(f"✓ Checkpoint loaded: {checkpoint_name}")
+        # Load metadata
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
         
-        # Validate checkpoint integrity
-        if checkpoint_name == "stage2_progress":
-            if 'stage2_data' in data and 'processed_doc_ids' in data:
-                data_len = len(data['stage2_data'])
-                ids_len = len(data['processed_doc_ids'])
-                if ids_len > data_len * 1.5:
-                    logger.warning(f"⚠ Suspicious checkpoint: {ids_len} IDs vs {data_len} data items")
-                    logger.warning("Deleting corrupted checkpoint...")
-                    os.remove(checkpoint_path)
-                    return None
+        total_records = metadata.get('total_records', 0)
+        logger.info(f"🔄 Streaming {checkpoint_name}: {total_records} total records in batches of {chunk_size}")
         
-        return data
-    except (EOFError, pickle.UnpicklingError, ValueError) as e:
-        logger.error(f"✗ Corrupted checkpoint {checkpoint_name}: {e}")
-        logger.info(f"Deleting corrupted checkpoint...")
+        # Stream from chunk files
+        chunk_idx = 0
+        batch = []
+        records_streamed = 0
+        
+        while True:
+            chunk_path = os.path.join(CHECKPOINT_DIR, f"{checkpoint_name}_chunk_{chunk_idx:04d}.parquet")
+            
+            if not os.path.exists(chunk_path):
+                break  # No more chunks
+            
+            # Read Parquet chunk
+            table = pq.read_table(chunk_path)
+            chunk_recs = [_restore_row_from_parquet(r) for r in table.to_pylist()]
+            for rec in chunk_recs:
+                batch.append(rec)
+                streamed += 1
+                if len(batch) >= chunk_size:
+                    yield batch
+                    batch = []
+                    gc.collect()
+            chunk_idx += 1
+        
+        # Yield final partial batch
+        if batch:
+            logger.debug(f"Yielding final batch ({len(batch)} records)")
+            yield batch
+        
+        logger.info(f"✓ Streaming complete: {records_streamed} records processed")
+        
+    except Exception as e:
+        logger.error(f"✗ Streaming failed for {checkpoint_name}: {e}")
+        return
+
+
+# ============================================================================
+# LOAD CHECKPOINT (FULL, LEGACY COMPATIBILITY)
+# ============================================================================
+
+def load_checkpoint(checkpoint_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Load entire checkpoint into memory (for backward compatibility).
+    Reconstructs original dict structure {'doc_data': [...], ...}.
+    
+    WARNING: May cause OOM for large checkpoints. Prefer load_checkpoint_streaming().
+    
+    Args:
+        checkpoint_name: Base name of checkpoint
+    
+    Returns:
+        Dict or None if not found/corrupted
+    """
+    metadata_path = os.path.join(CHECKPOINT_DIR, f"{checkpoint_name}_meta.json")
+    if not os.path.exists(metadata_path): return None
+
+    try:
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+            
+        data_key = metadata.pop('data_key', 'doc_data')
+        total_records = metadata.pop('total_records', 0)
+        was_dict = metadata.get('was_dict', False)
+        keys = metadata.pop(f'{data_key}_keys', None) if was_dict else None
+
+        logger.info(f"⚠ Full load {checkpoint_name} ({total_records} recs)")
+
+        all_records = []
+        chunk_idx = 0
+        while True:
+            chunk_path = os.path.join(CHECKPOINT_DIR, f"{checkpoint_name}_chunk_{chunk_idx:04d}.parquet")
+            if not os.path.exists(chunk_path): break
+            table = pq.read_table(chunk_path)
+            all_records.extend([_restore_row_from_parquet(r) for r in table.to_pylist()])
+            chunk_idx += 1
+            
         try:
-            os.remove(checkpoint_path)
-            logger.info(f"✓ Deleted corrupted checkpoint")
-        except Exception as del_e:
-            logger.error(f"✗ Failed to delete checkpoint: {del_e}")
+            if 'doc_data_keys' in metadata and metadata.get('was_dict', False):
+                # Reconstruct sparse dict with gaps preserved
+                result_data = {keys[i]: total_records[i] for i, k in enumerate(keys) if i < len(total_records)}
+            else:
+                result_data = {i: rec for i, rec in enumerate(all_records)}
+        except:
+            traceback.print_exc()
+            
+        # Reconstruct dict if original was dict
+        if was_dict and keys and len(keys) == len(all_records):
+            result_data = {keys[i]: all_records[i] for i in range(len(all_records))}
+        else:
+            result_data = all_records
+
+        result = {data_key: result_data}
+        result.update(metadata)
+        logger.info(f"✓ Loaded {checkpoint_name}")
+        return result
+    except Exception as e:
+        logger.error(f"✗ Load failed: {e}")
         return None
+
+# ============================================================================
+# UTILITY: Check if checkpoint exists
+# ============================================================================
+
+def checkpoint_exists(checkpoint_name: str) -> bool:
+    """Check if a checkpoint exists."""
+    metadata_path = os.path.join(CHECKPOINT_DIR, f"{checkpoint_name}_meta.json")
+    return os.path.exists(metadata_path)
+
+
+# ============================================================================
+# UTILITY: Delete checkpoint
+# ============================================================================
+
+def delete_checkpoint(checkpoint_name: str) -> bool:
+    """Delete all files associated with a checkpoint."""
+    try:
+        metadata_path = os.path.join(CHECKPOINT_DIR, f"{checkpoint_name}_meta.json")
+        
+        if os.path.exists(metadata_path):
+            os.remove(metadata_path)
+        
+        # Delete all chunk files
+        chunk_idx = 0
+        while True:
+            chunk_path = os.path.join(CHECKPOINT_DIR, f"{checkpoint_name}_chunk_{chunk_idx:04d}.parquet")
+            if not os.path.exists(chunk_path):
+                break
+            os.remove(chunk_path)
+            chunk_idx += 1
+        
+        logger.info(f"✓ Deleted checkpoint: {checkpoint_name} ({chunk_idx} chunks)")
+        return True
+    except Exception as e:
+        logger.error(f"✗ Failed to delete checkpoint {checkpoint_name}: {e}")
+        return False
 
 logger.info("="*80)
 logger.info("LOADING EMBEDDING MODEL (SCM REQUIREMENT: 1024-DIM SONAR)")
@@ -682,10 +945,10 @@ def determine_hierarchy(text, compartment):
     # Score-based fallback    
     if compartment == 'FACTUAL':
         # Factual statements: Specificity = granular, generalizations = general
-        if granular_score >= 2:
-            return 'GRANULAR'
-        elif general_score >= 2:
+        if general_score >= 2:
             return 'GENERAL'
+        elif granular_score >= 2:
+            return 'GRANULAR'
         elif intermediate_score >= 1:
             return 'INTERMEDIATE'
         else:
@@ -757,7 +1020,7 @@ def get_precision_requirement(compartment, hierarchy):
     if compartment == 'FACTUAL':
         return 'fp32'
     elif compartment == 'PROCEDURAL' or compartment == 'CONTEXTUAL':
-        return 'fp32' if hierarchy == 'INTERMEDIATE' or hierarchy == 'GRANULAR' else 'fp16'
+        return 'fp32' if hierarchy == 'GRANULAR' else 'fp16'
     else:
         return 'fp16'
 
@@ -881,346 +1144,466 @@ logger.info("Applying science content filter...")
 science_dataset_stream = dataset.filter(is_science_content)
 logger.info("✓ Science filter applied")
 
-# logger.info("="*80)
-# logger.info("STAGE 1: PRE-TRAINING DATA GENERATION")
-# logger.info("SCM Compliance: 1024-dim embeddings + diffusion noise")
-# logger.info("="*80)
+logger.info("="*80)
+logger.info("STAGE 1: PRE-TRAINING DATA GENERATION")
+logger.info("SCM Compliance: 1024-dim embeddings + diffusion noise")
+logger.info("="*80)
 
-# checkpoint_data = load_checkpoint("stage1_processing")
+checkpoint_data = load_checkpoint("stage1_processing")
 
-# if checkpoint_data:
-#     doc_data = checkpoint_data.get('doc_data', {})
-#     stage1_data = checkpoint_data.get('stage1_data', [])
-#     doc_count = checkpoint_data.get('doc_count', 0)
-#     science_count = checkpoint_data.get('science_count', 0)
-#     last_processed_idx = checkpoint_data.get('last_idx', -1)
+if checkpoint_data:
+    doc_data_list = checkpoint_data.get('doc_data', [])
+    doc_ids = checkpoint_data.get('doc_ids_processed', list(range(len(doc_data_list))))
+    doc_data = {doc_ids[i]: doc_data_list[i] for i in range(min(len(doc_data_list), len(doc_ids)))}
     
-#     logger.info(f"✓ Resuming from checkpoint:")
-#     logger.info(f"  - Processed docs: {doc_count}")
-#     logger.info(f"  - Stage 1 samples: {len(stage1_data)}")
-#     logger.info(f"  - Last global index: {last_processed_idx}")
-# else:
-#     doc_data = {}
-#     stage1_data = []
-#     doc_count = 0
-#     science_count = 0
-#     last_processed_idx = -1
-#     logger.info("Starting fresh Stage 1 processing...")
-
-# logger.info(f"Processing up to {MAX_DOCS_TO_PROCESS} science docs...")
-# logger.info(f"Checkpoint interval: every {STAGE1_CHECKPOINT_INTERVAL} docs")
-
-# # FIX #1 & #2: Track last written position for incremental append
-# last_written_stage1_idx = 0
-
-# # FIX #14: Skip already-processed documents efficiently
-# if last_processed_idx >= 0:
-#     logger.info(f"Skipping {last_processed_idx + 1} already-processed documents...")
-#     science_dataset_stream = science_dataset_stream.skip(last_processed_idx + 1)
-#     global_idx = last_processed_idx + 1
-# else:
-#     global_idx = 0
-
-# docs_processed_this_run = 0
-
-# for example in tqdm(science_dataset_stream, desc="Stage 1 Processing", total=MAX_DOCS_TO_PROCESS - global_idx):
-#     if doc_count >= MAX_DOCS_TO_PROCESS:
-#         logger.info(f"Reached MAX_DOCS_TO_PROCESS limit ({MAX_DOCS_TO_PROCESS}). Stopping.")
-#         break
+    stage1_data = checkpoint_data.get('stage1_data', [])
+    doc_count = checkpoint_data.get('doc_count', 0)
+    science_count = checkpoint_data.get('science_count', 0)
+    last_processed_idx = checkpoint_data.get('last_idx', -1)
     
-#     full_text = extract_text_from_conversations(example)
-#     if not full_text or len(full_text) < 20:
-#         logger.debug(f"Doc {global_idx}: Skipped (text too short)")
-#         global_idx += 1
-#         continue
+    logger.info(f"✓ Resuming from checkpoint:")
+    logger.info(f"  - Processed docs: {doc_count}")
+    logger.info(f"  - Stage 1 samples: {len(stage1_data)}")
+    logger.info(f"  - Last global index: {last_processed_idx}")
+else:
+    doc_data = {}
+    stage1_data = []
+    doc_count = 0
+    science_count = 0
+    last_processed_idx = -1
+    logger.info("Starting fresh Stage 1 processing...")
+
+logger.info(f"Processing up to {MAX_DOCS_TO_PROCESS} science docs...")
+logger.info(f"Checkpoint interval: every {STAGE1_CHECKPOINT_INTERVAL} docs")
+
+# FIX #1 & #2: Track last written position for incremental append
+last_written_stage1_idx = 0
+
+# FIX #14: Skip already-processed documents efficiently
+if last_processed_idx >= 0:
+    logger.info(f"Skipping {last_processed_idx + 1} already-processed documents...")
+    science_dataset_stream = science_dataset_stream.skip(last_processed_idx + 1)
+    global_idx = last_processed_idx + 1
+else:
+    global_idx = 0
+
+docs_processed_this_run = 0
+
+for example in tqdm(science_dataset_stream, desc="Stage 1 Processing", total=MAX_DOCS_TO_PROCESS - global_idx):
+    if doc_count >= MAX_DOCS_TO_PROCESS:
+        logger.info(f"Reached MAX_DOCS_TO_PROCESS limit ({MAX_DOCS_TO_PROCESS}). Stopping.")
+        break
     
-#     query = ""
-#     conversations = example.get('conversations', [])
-#     for conv in conversations:
-#         if 'user' in str(conv.get('from', '')).lower():
-#             query = conv.get('value', '')
-#             break
+    full_text = extract_text_from_conversations(example)
+    if not full_text or len(full_text) < 20:
+        logger.debug(f"Doc {global_idx}: Skipped (text too short)")
+        global_idx += 1
+        continue
     
-#     sentences = sent_tokenize(full_text[:MAX_TEXT_LENGTH])
-#     segments = []
+    query = ""
+    conversations = example.get('conversations', [])
+    for conv in conversations:
+        if 'user' in str(conv.get('from', '')).lower():
+            query = conv.get('value', '')
+            break
     
-#     for i, sent in enumerate(sentences):
-#         if len(sent.strip()) < MIN_SENTENCE_LENGTH:
-#             continue
+    sentences = sent_tokenize(full_text[:MAX_TEXT_LENGTH])
+    segments = []
+    
+    for i, sent in enumerate(sentences):
+        if len(sent.strip()) < MIN_SENTENCE_LENGTH:
+            continue
         
-#         comp = estimate_compartment_advanced(sent)
-#         hier = determine_hierarchy(sent, comp)  # ✅ Pass compartment
+        comp = estimate_compartment_advanced(sent)
+        hier = determine_hierarchy(sent, comp)  # ✅ Pass compartment
         
-#         # ✅ Generate embedding HERE (before appending to segments)
-#         try:
-#             segment_embedding = sonar_encoder.encode(sent.strip())
-#             if isinstance(segment_embedding, np.ndarray):
-#                 segment_embedding = segment_embedding.tolist()
-#             elif hasattr(segment_embedding, 'tolist'):
-#                 segment_embedding = segment_embedding.tolist()
-#             elif hasattr(segment_embedding, 'cpu'):  # PyTorch tensor
-#                 segment_embedding = segment_embedding.cpu().numpy().tolist()
-#             elif hasattr(segment_embedding, 'numpy'):  # TF tensor
-#                 segment_embedding = segment_embedding.numpy().tolist()
-#             else:
-#                 # Last resort: convert to numpy first
-#                 segment_embedding = np.array(segment_embedding).tolist()
+        # ✅ Generate embedding HERE (before appending to segments)
+        try:
+            segment_embedding = sonar_encoder.encode(sent.strip())
+            if isinstance(segment_embedding, np.ndarray):
+                segment_embedding = segment_embedding.tolist()
+            elif hasattr(segment_embedding, 'tolist'):
+                segment_embedding = segment_embedding.tolist()
+            elif hasattr(segment_embedding, 'cpu'):  # PyTorch tensor
+                segment_embedding = segment_embedding.cpu().numpy().tolist()
+            elif hasattr(segment_embedding, 'numpy'):  # TF tensor
+                segment_embedding = segment_embedding.numpy().tolist()
+            else:
+                # Last resort: convert to numpy first
+                segment_embedding = np.array(segment_embedding).tolist()
                 
-#             if not isinstance(segment_embedding, list):
-#                 raise TypeError(f"Embedding is {type(segment_embedding)}, expected list")
+            if not isinstance(segment_embedding, list):
+                raise TypeError(f"Embedding is {type(segment_embedding)}, expected list")
             
-#         except Exception as e:
-#             logger.warning(f"Doc {global_idx}, Seg {i}: Embedding failed - {e}")
-#             logger.warning(f"Embedding logic failed! Pause pipeline and fix.")
-#             continue  # Skip segment if embedding fails
+        except Exception as e:
+            logger.warning(f"Doc {global_idx}, Seg {i}: Embedding failed - {e}")
+            logger.warning(f"Embedding logic failed! Pause pipeline and fix.")
+            continue  # Skip segment if embedding fails
         
-#         if len(segment_embedding) != 1024:
-#             logger.error(f"Doc {global_idx}, Seg {i}: Embedding dimension is {len(segment_embedding)}, expected 1024")
-#             logger.error("CRITICAL: SCM compliance violated! Pausing pipeline.")
-#             raise ValueError(f"Embedding dimension mismatch: {len(segment_embedding)} vs 1024")
+        if len(segment_embedding) != 1024:
+            logger.error(f"Doc {global_idx}, Seg {i}: Embedding dimension is {len(segment_embedding)}, expected 1024")
+            logger.error("CRITICAL: SCM compliance violated! Pausing pipeline.")
+            raise ValueError(f"Embedding dimension mismatch: {len(segment_embedding)} vs 1024")
 
         
-#         segments.append({
-#             'text': sent.strip(),
-#             'compartment': comp,
-#             'hierarchy': hier,
-#             'position': i,
-#             'sonar_embedding': segment_embedding  # ✅ Store embedding
-#         })
+        segments.append({
+            'text': sent.strip(),
+            'compartment': comp,
+            'hierarchy': hier,
+            'position': i,
+            'sonar_embedding': segment_embedding  # ✅ Store embedding
+        })
     
-#     if segments:
-#         # Sample first doc in detail
-#         if doc_count == 0:
-#             logger.info(f"\n{'='*60}")
-#             logger.info(f"SAMPLE DOCUMENT (Doc {global_idx})")
-#             logger.info(f"{'='*60}")
-#             logger.info(f"Query: {query[:200]}...")
-#             logger.info(f"Text length: {len(full_text)} chars")
-#             logger.info(f"Segments: {len(segments)}")
-#             logger.info(f"Domain: {example.get('domain', 'N/A')}")
-#             logger.info(f"\nFirst 3 segments:")
-#             for seg in segments[:3]:
-#                 imp_score = compute_importance_score(seg['text'])
-#                 prec = get_precision_requirement(seg['compartment'], seg['hierarchy'])
-#                 logger.info(f"  [{seg['compartment']}] [{seg['hierarchy']}] [imp:{imp_score}] [prec:{prec}]")
-#                 logger.info(f"    Text: {seg['text'][:100]}...")
-#             logger.info(f"{'='*60}\n")
-#         if logger.isEnabledFor(logging.DEBUG):
-#             logger.debug(f"--- DOC {global_idx} ---")
-#             logger.debug(f"  Domain: {example.get('domain', 'N/A')}")
-#             logger.debug(f"  Source: {example.get('source', 'N/A')}")
-#             logger.debug(f"  Difficulty: {example.get('difficulty', 0)}")
-#             logger.debug(f"  Segments: {len(segments)}")
-#             logger.debug(f"  Query: {query[:100]}")
-#             for i, seg in enumerate(segments[:5]):
-#                 logger.debug(f"    Seg {i}: [{seg['compartment']}] [{seg['hierarchy']}] {seg['text'][:50]}...")
+    if segments:
+        # Sample first doc in detail
+        if doc_count == 0:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"SAMPLE DOCUMENT (Doc {global_idx})")
+            logger.info(f"{'='*60}")
+            logger.info(f"Query: {query[:200]}...")
+            logger.info(f"Text length: {len(full_text)} chars")
+            logger.info(f"Segments: {len(segments)}")
+            logger.info(f"Domain: {example.get('domain', 'N/A')}")
+            logger.info(f"\nFirst 3 segments:")
+            for seg in segments[:3]:
+                imp_score = compute_importance_score(seg['text'])
+                prec = get_precision_requirement(seg['compartment'], seg['hierarchy'])
+                logger.info(f"  [{seg['compartment']}] [{seg['hierarchy']}] [imp:{imp_score}] [prec:{prec}]")
+                logger.info(f"    Text: {seg['text'][:100]}...")
+            logger.info(f"{'='*60}\n")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"--- DOC {global_idx} ---")
+            logger.debug(f"  Domain: {example.get('domain', 'N/A')}")
+            logger.debug(f"  Source: {example.get('source', 'N/A')}")
+            logger.debug(f"  Difficulty: {example.get('difficulty', 0)}")
+            logger.debug(f"  Segments: {len(segments)}")
+            logger.debug(f"  Query: {query[:100]}")
+            for i, seg in enumerate(segments[:5]):
+                logger.debug(f"    Seg {i}: [{seg['compartment']}] [{seg['hierarchy']}] {seg['text'][:50]}...")
         
-#         doc_data[global_idx] = {
-#             'segments': segments,
-#             'query': query or full_text[:200],
-#             'domain': example.get('domain', 'science'),
-#             'source': example.get('source', 'OpenThoughts3'),
-#             'difficulty': example.get('difficulty', 0)
-#         }
-        
-#         segments_added = 0
-#         for seg in segments:
-#             try:
-#                 # Generate clean embedding (1024-dim)
-#                 clean_embedding = seg['sonar_embedding']
+        if global_idx not in doc_data:
+        # Fill gaps with None docs
+            max_key = max(doc_data.keys()) if doc_data else -1
+            for idx in range(max_key + 1, global_idx):
+                doc_data[idx] = {'segments': [], 'query': '', 'domain': 'unknown'}
                 
-#                 if not isinstance(clean_embedding, list):
-#                     if hasattr(clean_embedding, 'tolist'):
-#                         clean_embedding = clean_embedding.tolist()
-#                     elif isinstance(clean_embedding, np.ndarray):
-#                         clean_embedding = clean_embedding.tolist()
-#                     else:
-#                         raise TypeError(f"Invalid embedding type: {type(clean_embedding)}")
+        doc_data[global_idx] = {
+            'segments': segments,
+            'query': query or full_text[:200],
+            'domain': example.get('domain', 'science'),
+            'source': example.get('source', 'OpenThoughts3'),
+            'difficulty': example.get('difficulty', 0)
+        }
+        
+        segments_added = 0
+        for seg in segments:
+            try:
+                # Generate clean embedding (1024-dim)
+                clean_embedding = seg['sonar_embedding']
                 
-#                 # Apply diffusion noise
-#                 noisy_embedding, timestep, alpha_t = apply_diffusion_noise(clean_embedding)
+                if not isinstance(clean_embedding, list):
+                    if hasattr(clean_embedding, 'tolist'):
+                        clean_embedding = clean_embedding.tolist()
+                    elif isinstance(clean_embedding, np.ndarray):
+                        clean_embedding = clean_embedding.tolist()
+                    else:
+                        raise TypeError(f"Invalid embedding type: {type(clean_embedding)}")
                 
-#             except Exception as e:
-#                 logger.warning(f"Doc {global_idx}, Seg {seg['position']}: Embedding failed - {e}")
-#                 continue
+                # Apply diffusion noise
+                noisy_embedding, timestep, alpha_t = apply_diffusion_noise(clean_embedding)
+                
+            except Exception as e:
+                logger.warning(f"Doc {global_idx}, Seg {seg['position']}: Embedding failed - {e}")
+                continue
             
-#             tech_terms = extract_technical_terms(seg['text'])
-#             importance = compute_importance_score(seg['text'])
-#             precision = get_precision_requirement(seg['compartment'], seg['hierarchy'])
+            tech_terms = extract_technical_terms(seg['text'])
+            importance = compute_importance_score(seg['text'])
+            precision = get_precision_requirement(seg['compartment'], seg['hierarchy'])
             
-#             # FIX #7: Include query and difficulty
-#             stage1_sample = {
-#                 "id": f"pretrain_{global_idx:06d}_{seg['position']}",
-#                 "text": seg['text'],
-#                 "clean_embedding": seg['sonar_embedding'],  # ✅ Reuse from segment
-#                 "noisy_embedding": noisy_embedding,
-#                 "timestep": timestep,
-#                 "alpha_t": alpha_t,
-#                 "compartment": seg['compartment'],
-#                 "hierarchical_level": seg['hierarchy'].lower(),
-#                 "query": doc_data[global_idx]['query'],  # FIX #7
-#                 "metadata": {
-#                     "domain": doc_data[global_idx]['domain'],
-#                     "source": doc_data[global_idx]['source'],
-#                     "difficulty": doc_data[global_idx]['difficulty'],  # FIX #7
-#                     "technical_terms": tech_terms,
-#                     "precision_required": precision,
-#                     "importance_score": importance,
-#                     "fragility_score": None
-#                 },
-#                 "diffusion_config": {
-#                     "noise_schedule": "cosine",
-#                     "sigma_min": DIFFUSION_SIGMA_MIN,
-#                     "sigma_max": DIFFUSION_SIGMA_MAX,
-#                     "t_max": DIFFUSION_T_MAX
-#                 }
-#             }
+            # FIX #7: Include query and difficulty
+            stage1_sample = {
+                "id": f"pretrain_{global_idx:06d}_{seg['position']}",
+                "text": seg['text'],
+                "clean_embedding": seg['sonar_embedding'],  # ✅ Reuse from segment
+                "noisy_embedding": noisy_embedding,
+                "timestep": timestep,
+                "alpha_t": alpha_t,
+                "compartment": seg['compartment'],
+                "hierarchical_level": seg['hierarchy'].lower(),
+                "query": doc_data[global_idx]['query'],  # FIX #7
+                "metadata": {
+                    "domain": doc_data[global_idx]['domain'],
+                    "source": doc_data[global_idx]['source'],
+                    "difficulty": doc_data[global_idx]['difficulty'],  # FIX #7
+                    "technical_terms": tech_terms,
+                    "precision_required": precision,
+                    "importance_score": importance,
+                    "fragility_score": None
+                },
+                "diffusion_config": {
+                    "noise_schedule": "cosine",
+                    "sigma_min": DIFFUSION_SIGMA_MIN,
+                    "sigma_max": DIFFUSION_SIGMA_MAX,
+                    "t_max": DIFFUSION_T_MAX
+                }
+            }
             
-#             stage1_data.append(stage1_sample)
-#             segments_added += 1
+            stage1_data.append(stage1_sample)
+            segments_added += 1
         
-#         logger.debug(f"Doc {global_idx}: Added {segments_added}/{len(segments)} segments")
+        logger.debug(f"Doc {global_idx}: Added {segments_added}/{len(segments)} segments")
         
-#         doc_count += 1
-#         docs_processed_this_run += 1
+        doc_count += 1
+        docs_processed_this_run += 1
         
-#         if doc_count % STAGE1_CHECKPOINT_INTERVAL == 0:
-#             logger.info(f"\n--- CHECKPOINT at {doc_count} docs ---")
-#             logger.info(f"Total Stage 1 samples: {len(stage1_data)}")
-#             logger.info(f"Memory usage: {len(stage1_data) * 1024 * 4 / (1024**2):.2f} MB")
+        if doc_count % STAGE1_CHECKPOINT_INTERVAL == 0:
+            logger.info(f"\n--- CHECKPOINT at {doc_count} docs ---")
+            logger.info(f"Total Stage 1 samples: {len(stage1_data)}")
+            logger.info(f"Memory usage: {len(stage1_data) * 1024 * 4 / (1024**2):.2f} MB")
             
-#             # Lightweight checkpoint (metadata only for speed)
-#             checkpoint_meta = {
-#                 'doc_data': doc_data,
-#                 'stage1_data': [],
-#                 'doc_count': doc_count,
-#                 'science_count': science_count,
-#                 'last_idx': global_idx,
-#                 'doc_ids_processed': list(doc_data.keys())
-#             }
+            # Lightweight checkpoint (metadata only for speed)
+            checkpoint_meta = {
+                'doc_data': list(doc_data.values()),  # All processed documents
+                'stage1_data': stage1_data.copy(),
+                'doc_count': doc_count,
+                'science_count': science_count,
+                'last_idx': global_idx - 1,
+                'doc_ids_processed': list(doc_data.keys())
+            }
             
-#             save_checkpoint(checkpoint_meta, "stage1_processing")
-#             logger.info(f"Saved lightweight checkpoint")
+            save_checkpoint(checkpoint_meta, "stage1_processing")
+            logger.info(f"Saved lightweight checkpoint")
             
-#             # FIX #1: Proper incremental append (only NEW samples)
-#             stage1_file = os.path.join(OUTPUT_PATH, "stage1_pretrain.jsonl")
-#             try:
-#                 with open(stage1_file, 'a', encoding='utf-8') as f:
-#                     for item in stage1_data[last_written_stage1_idx:]:
-#                         f.write(json.dumps(item, ensure_ascii=False) + "\n")
-#                 print("successfully appended stage1")
-#             except:
-#                 with open(stage1_file, 'a', encoding='utf-8') as f:
-#                     for item in stage1_data[last_written_stage1_idx:]:
-#                         f.write(json.dumps(item, ensure_ascii=False) + '\n')
-#                 print("successfully appended stage1 in except block")
+            # FIX #1: Proper incremental append (only NEW samples)
+            stage1_file = os.path.join(OUTPUT_PATH, "stage1_pretrain.jsonl")
+            try:
+                with open(stage1_file, 'a', encoding='utf-8') as f:
+                    for item in stage1_data[last_written_stage1_idx:]:
+                        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                print("successfully appended stage1")
+            except:
+                with open(stage1_file, 'a', encoding='utf-8') as f:
+                    for item in stage1_data[last_written_stage1_idx:]:
+                        f.write(json.dumps(item, ensure_ascii=False) + '\n')
+                print("successfully appended stage1 in except block")
             
-#             # FIX #1: Update tracker
-#             written_count = len(stage1_data) - last_written_stage1_idx
-#             logger.info(f"Appended {written_count} new samples to Stage 1 JSONL")
+            # FIX #1: Update tracker
+            written_count = len(stage1_data) - last_written_stage1_idx
+            logger.info(f"Appended {written_count} new samples to Stage 1 JSONL")
             
-#             stage1_data.clear() # Keep unwritten
-#             last_written_stage1_idx = 0  # Reset tracker for next batch
-#             gc.collect()
-#             logger.info(f"Memory freed (retained {len(stage1_data)} unwritten samples)")
+            stage1_data.clear() # Keep unwritten
+            last_written_stage1_idx = 0  # Reset tracker for next batch
+            gc.collect()
+            logger.info(f"Memory freed (retained {len(stage1_data)} unwritten samples)")
             
-#             logger.info("--- CHECKPOINT COMPLETE ---\n")
+            logger.info("--- CHECKPOINT COMPLETE ---\n")
     
-#     global_idx += 1
+    global_idx += 1
 
-# logger.info(f"\n{'='*80}")
-# logger.info(f"STAGE 1 COMPLETE")
-# logger.info(f"{'='*80}")
-# logger.info(f"Total docs: {doc_count}")
-# logger.info(f"Total samples: {len(stage1_data) + last_written_stage1_idx}")
-# logger.info(f"Docs with segments: {len(doc_data)}")
+logger.info(f"\n{'='*80}")
+logger.info(f"STAGE 1 COMPLETE")
+logger.info(f"{'='*80}")
+logger.info(f"Total docs: {doc_count}")
+logger.info(f"Total samples: {len(stage1_data) + last_written_stage1_idx}")
+logger.info(f"Docs with segments: {len(doc_data)}")
 
-# # FIX #3: Save full doc_data at end (with segments for Stage 2)
-# save_checkpoint({
-#     'doc_data': doc_data,  # Full data with segments
-#     'stage1_data': [],
-#     'doc_count': doc_count,
-#     'science_count': science_count,
-#     'last_idx': global_idx - 1,
-#     'doc_ids_processed': list(doc_data.keys())
-# }, "stage1_processing")
+# FIX #3: Save full doc_data at end (with segments for Stage 2)
+save_checkpoint({
+    'doc_data': doc_data,  # Full data with segments
+    'stage1_data': stage1_data.copy(),
+    'doc_count': doc_count,
+    'science_count': science_count,
+    'last_idx': global_idx - 1,
+    'doc_ids_processed': list(doc_data.keys())
+}, "stage1_processing")
 
-# # FIX #2: Correct final write logic (append remaining samples)
-# stage1_file = os.path.join(OUTPUT_PATH, "stage1_pretrain.jsonl")
+# FIX #2: Correct final write logic (append remaining samples)
+stage1_file = os.path.join(OUTPUT_PATH, "stage1_pretrain.jsonl")
 
-# if last_written_stage1_idx < len(stage1_data):
-#     logger.info(f"Writing final {len(stage1_data) - last_written_stage1_idx} Stage 1 samples...")
-#     with open(stage1_file, 'a', encoding='utf-8') as f:
-#         for item in stage1_data[last_written_stage1_idx:]:
-#             f.write(json.dumps(item, ensure_ascii=False) + "\n")
-#     logger.info(f"✓ Final write complete")
-# else:
-#     logger.info(f"No remaining Stage 1 samples to write")
+if last_written_stage1_idx < len(stage1_data):
+    logger.info(f"Writing final {len(stage1_data) - last_written_stage1_idx} Stage 1 samples...")
+    with open(stage1_file, 'a', encoding='utf-8') as f:
+        for item in stage1_data[last_written_stage1_idx:]:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    logger.info(f"✓ Final write complete")
+else:
+    logger.info(f"No remaining Stage 1 samples to write")
 
-# # Count final samples
-# if os.path.exists(stage1_file):
-#     with open(stage1_file, 'r', encoding='utf-8') as f:
-#         final_stage1_count = sum(1 for _ in f)
-#     logger.info(f"Stage 1 JSONL total: {final_stage1_count} samples")
+# Count final samples
+if os.path.exists(stage1_file):
+    with open(stage1_file, 'r', encoding='utf-8') as f:
+        final_stage1_count = sum(1 for _ in f)
+    logger.info(f"Stage 1 JSONL total: {final_stage1_count} samples")
 
-# save_checkpoint({'doc_data': doc_data}, "doc_data_for_stage2")
+save_checkpoint({'doc_data': list(doc_data.values())}, "doc_data_for_stage2")
 
-# del stage1_data
-# gc.collect()
-# logger.info("✓ Memory cleared")
+del stage1_data
+gc.collect()
+logger.info("✓ Memory cleared")
 
 
 # ===================================================================
 # LOAD doc_data FROM STAGE 1 (FOR STAGE 2)
 # ===================================================================
 
+def process_documents_batch(chunk):
+    """
+    Process a batch (chunk) of documents from loaded checkpoint.
+
+    Args:
+        chunk (List[Dict]): List of documents with segments, each segment having embedding etc.
+
+    Returns:
+        List processed_docs: List of processed document dicts ready for model training/inference.
+    """
+    processed_docs = []
+
+    for doc in chunk:
+        # Validate document structure
+        if 'segments' not in doc or not isinstance(doc['segments'], list) or len(doc['segments']) == 0:
+            logger.warning("Skipping document with no valid segments")
+            continue
+
+        processed_segments = []
+        for seg in doc['segments']:
+            
+            logger.info(f"segment info: = {seg}")
+            # Validate critical keys in segment
+            if 'sonar_embedding' not in seg:
+                logger.error("Segment missing 'sonar_embedding'; skipping segment")
+                continue
+
+            # Validate embedding dimension (expect 1024)
+            emb = seg['sonar_embedding']
+            if len(emb) != 1024:
+                logger.error(f"Segment embedding dimension {len(emb)} != 1024; skipping segment")
+                continue
+
+            # Compute or confirm importance_score and precision_level
+            if 'importance_score' not in seg:
+                # Use your heuristic to compute importance score from text
+                importance = compute_importance_score(seg.get('text', ''))
+                seg['importance_score'] = importance
+            else:
+                importance = seg['importance_score']
+
+            if 'precision_level' not in seg:
+                # Assign precision level based on importance or compartment heuristics
+                precision = get_precision_requirement(
+                    seg.get('compartment', 'FACTUAL'),
+                    seg.get('hierarchy', 'GRANULAR')
+                )
+                seg['precision_level'] = precision
+            else:
+                precision = seg['precision_level']
+
+
+            # Append processed segment
+            processed_segments.append(seg)
+
+        if len(processed_segments) == 0:
+            logger.warning("No valid segments after processing; skipping document")
+            continue
+
+        # Construct processed document with updated segments
+        processed_doc = dict(doc)  # shallow copy
+        processed_doc['segments'] = processed_segments
+
+        # Optionally, do higher-level aggregation or metadata updates here
+
+        processed_docs.append(processed_doc)
+
+    logger.info(f"Processed {len(processed_docs)} documents in batch (input size: {len(chunk)})")
+    return processed_docs
+
 logger.info("="*80)
 logger.info("LOADING doc_data FROM STAGE 1 CHECKPOINT")
 logger.info("="*80)
 
-try:
-    doc_data = None
+if BASE_PATH==WSL_PATH:
+    try:
+        logger.info("LOADING doc_data FROM STAGE 1 CHECKPOINT with chunked strategy...")
+        doc_data_chunks = load_checkpoint_streaming("stage1_processing", chunk_size=25)
 
-    # Try loading from Stage 1 checkpoint
-    checkpoint_data = load_checkpoint("stage1_processing")
-    if checkpoint_data and 'doc_data' in checkpoint_data:
-        doc_data = checkpoint_data['doc_data']
-        logger.info(f"✓ Loaded doc_data from stage1_processing: {len(doc_data)} documents")
+        if doc_data_chunks is None:
+            logger.error("✗ No doc_data found! Stage 1 must be completed first.")
+            logger.error("Expected checkpoint: stage1_processing.pkl or doc_data_for_stage2.pkl")
+            raise ValueError("Cannot proceed with Stage 2: No doc_data available")
 
-    # Fallback: Try doc_data_for_stage2 checkpoint
-    if not doc_data:
-        doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
-        if doc_data_checkpoint and 'doc_data' in doc_data_checkpoint:
-            doc_data = doc_data_checkpoint['doc_data']
-            logger.info(f"✓ Loaded doc_data from doc_data_for_stage2: {len(doc_data)} documents")
-
-    # Validation
-    logger.info(f"Using checkpoint directory: {CHECKPOINT_DIR}")
-
-    if not doc_data or len(doc_data) == 0:
-        logger.error("✗ No doc_data found! Stage 1 must be completed first.")
-        logger.error("Expected checkpoint: stage1_processing.pkl or doc_data_for_stage2.pkl")
-        raise ValueError("Cannot proceed with Stage 2: No doc_data available")
-
-    sample_doc = doc_data[list(doc_data.keys())[0]]
-    if 'segments' in sample_doc and len(sample_doc['segments']) > 0:
-        sample_seg = sample_doc['segments'][0]
+        all_processed_results = []
         
-        if 'sonar_embedding' not in sample_seg:
-            logger.error("❌ CRITICAL: Checkpoint has old format (missing sonar_embedding)")
-            logger.error("  Loaded doc_data does NOT contain embeddings in segments")
-            logger.error("  You MUST regenerate Stage 1 with fixed code")
-            raise ValueError("Incompatible checkpoint: Missing embeddings in segments")
+        for chunk in doc_data_chunks:
+            # Validate the chunk has embeddings in its first document
+            sample_doc = chunk[0]
+            if 'segments' in sample_doc and len(sample_doc['segments']) > 0:
+                sample_seg = sample_doc['segments'][0]
+                if 'sonar_embedding' not in sample_seg:
+                    logger.error("❌ CRITICAL: Checkpoint chunk missing sonar_embedding")
+                    raise ValueError("Incompatible checkpoint: Missing embeddings in segments")
+                emb_dim = len(sample_seg['sonar_embedding'])
+                if emb_dim != 1024:
+                    logger.error(f"❌ CRITICAL: Embeddings are {emb_dim}-dim, expected 1024")
+                    raise ValueError(f"SCM compliance violated: {emb_dim}-dim embeddings")
+            else:
+                logger.error("❌ Chunk has no valid segments")
+                raise ValueError("Invalid doc_data chunk format")
+
+            # Process chunks here
+            processed_chunk = process_documents_batch(chunk)
+            all_processed_results.extend(processed_chunk)
         
-        # Check dimension
-        emb_dim = len(sample_seg['sonar_embedding'])
-        if emb_dim != 1024:
-            logger.error(f"❌ CRITICAL: Embeddings are {emb_dim}-dim, expected 1024")
-            raise ValueError(f"SCM compliance violated: {emb_dim}-dim embeddings")
+        logger.info(f"✓ doc_data ready for Stage 2: processed {len(all_processed_results)} documents")
+        logger.info("="*80)
+
+    except Exception as e:
+        logger.error(f"Error during chunked doc_data processing: {e}")
+        import traceback
+        traceback.print_exc()
         
-        logger.info("✅ doc_data validated: Segments contain 1024-dim embeddings")
-except:
-    traceback.print_exc()
+else:
+    try:
+        doc_data = None
+
+        # Try loading from Stage 1 checkpoint
+        checkpoint_data = load_checkpoint_streaming("stage1_processing")
+        if checkpoint_data and 'doc_data' in checkpoint_data:
+            doc_data = checkpoint_data.get("doc_data", [])
+            logger.info(f"✓ Loaded doc_data from stage1_processing: {len(doc_data)} documents")
+
+        # Fallback: Try doc_data_for_stage2 checkpoint
+        if not doc_data:
+            doc_data_checkpoint = load_checkpoint_streaming("doc_data_for_stage2")
+            if doc_data_checkpoint and 'doc_data' in doc_data_checkpoint:
+                doc_data = checkpoint_data.get("doc_data", [])
+                logger.info(f"✓ Loaded doc_data from doc_data_for_stage2: {len(doc_data)} documents")
+
+        # Validation
+        logger.info(f"Using checkpoint directory: {CHECKPOINT_DIR}")
+
+        if not doc_data or len(doc_data) == 0:
+            logger.error("✗ No doc_data found! Stage 1 must be completed first.")
+            logger.error("Expected checkpoint: stage1_processing.pkl or doc_data_for_stage2.pkl")
+            raise ValueError("Cannot proceed with Stage 2: No doc_data available")
+
+        sample_doc = doc_data[list(doc_data.keys())[0]]
+        if 'segments' in sample_doc and len(sample_doc['segments']) > 0:
+            sample_seg = sample_doc['segments'][0]
+            
+            if 'sonar_embedding' not in sample_seg:
+                logger.error("❌ CRITICAL: Checkpoint has old format (missing sonar_embedding)")
+                logger.error("  Loaded doc_data does NOT contain embeddings in segments")
+                logger.error("  You MUST regenerate Stage 1 with fixed code")
+                raise ValueError("Incompatible checkpoint: Missing embeddings in segments")
+            
+            # Check dimension
+            emb_dim = len(sample_seg['sonar_embedding'])
+            if emb_dim != 1024:
+                logger.error(f"❌ CRITICAL: Embeddings are {emb_dim}-dim, expected 1024")
+                raise ValueError(f"SCM compliance violated: {emb_dim}-dim embeddings")
+            
+            logger.info("✅ doc_data validated: Segments contain 1024-dim embeddings")
+    except:
+        traceback.print_exc()
 
 logger.info(f"✓ doc_data ready for Stage 2: {len(doc_data)} documents")
 logger.info("="*80)
@@ -1233,7 +1616,7 @@ logger.info("="*80)
 stage2_file = os.path.join(OUTPUT_PATH, "stage2_sft.jsonl")
     
 # ✅ FIX: Always try to resume from checkpoint, even if file exists
-stage2_checkpoint = load_checkpoint("stage2_progress")
+stage2_checkpoint = load_checkpoint_streaming("stage2_progress")
 
 if stage2_checkpoint:
     # Resume from checkpoint (file may exist from previous run)
@@ -1293,9 +1676,9 @@ else:
 if len(processed_doc_ids) < len(doc_data):
     # FIX #11: Validate doc_data exists
     if not doc_data:
-        doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
+        doc_data_checkpoint = load_checkpoint_streaming("doc_data_for_stage2")
         if doc_data_checkpoint and 'doc_data' in doc_data_checkpoint:
-            doc_data = doc_data_checkpoint['doc_data']
+            doc_data = checkpoint_data.get("doc_data", [])
             logger.info(f"✓ Loaded doc_data: {len(doc_data)} documents")
         else:
             logger.error("✗ No doc_data. Run Stage 1 first.")
@@ -1315,7 +1698,7 @@ if len(processed_doc_ids) < len(doc_data):
     
     # FIX #11: Validate doc_data exists
     if not doc_data:
-        doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
+        doc_data_checkpoint = load_checkpoint_streaming("doc_data_for_stage2")
         if doc_data_checkpoint and 'doc_data' in doc_data_checkpoint:
             doc_data = doc_data_checkpoint['doc_data']
             logger.info(f"✓ Loaded doc_data: {len(doc_data)} documents")
@@ -2101,7 +2484,7 @@ def generate_candidates_looped(query, num_candidates=2, model=OLLAMA_MODEL):
 
 # Modified checkpoint section
 stage3_file = os.path.join(OUTPUT_PATH, "stage3_rlaif.jsonl")
-stage3_checkpoint = load_checkpoint("stage3_progress")
+stage3_checkpoint = load_checkpoint_streaming("stage3_progress")
 
 
 if stage3_checkpoint:
@@ -2118,7 +2501,7 @@ else:
 
 # Validate docdata
 if not doc_data:
-    doc_data_checkpoint = load_checkpoint("doc_data_for_stage2")
+    doc_data_checkpoint = load_checkpoint_streaming("doc_data_for_stage2")
     if doc_data_checkpoint:
         doc_data = doc_data_checkpoint["doc_data"]
 
